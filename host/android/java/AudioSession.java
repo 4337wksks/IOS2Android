@@ -97,7 +97,7 @@ final class AudioSession {
         return 0;
     }
     synchronized double property(int property) {
-        if (property == 0) return outputRate();
+        if (property == 0) return active && preferredRate > 0 ? preferredRate : outputRate();
         if (property == 1) return outputChannels();
         if (property == 2) {
             String frames = manager.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER);

@@ -151,6 +151,8 @@ static int32_t guest_audio_initialize(struct GuestAudioUnit *unit) {
     pthread_mutex_lock(&unit->mutex);
     if (unit->initialized) { pthread_mutex_unlock(&unit->mutex); return 0; }
     if (!unit->callback.function || !audio_format_supported(&unit->format)) { pthread_mutex_unlock(&unit->mutex); return -10868; }
+    double duration=audio_session_value(0,"preferredIOBufferDuration");
+    if (duration>0) unit->callback_frames=(uint32_t)fmin(unit->max_frames,fmax(1,round(duration*unit->format.rate)));
     AAudioStreamBuilder *builder=NULL;
     aaudio_result_t result=AAudio_createStreamBuilder(&builder);
     if (result==AAUDIO_OK) {
