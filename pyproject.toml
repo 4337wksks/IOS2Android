@@ -1,0 +1,10 @@
+[project]
+name = "IOS2Android"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "Offline ARM64 iOS image and Android host composition"
+license = {file = "LICENSE"}
+dependencies = ["lief", "capstone", "lzfse", "nibarchive"]
+
+[project.scripts]
+i2a = "porter.__main__:main"

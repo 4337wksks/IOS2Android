@@ -1,0 +1,14 @@
+Required Notice: Copyright (c) 2026 ThatSkyOldServer and the IOS2Android contributors.
+Required Notice: IOS2Android source repository: https://github.com/ThatSkyOldServer/IOS2Android
+
+IOS2Android is licensed under the PolyForm Noncommercial License 1.0.0.
+See LICENSE for the complete terms.
+
+Reference projects:
+- nx2android: https://github.com/shirai91/nx2android
+- Maclator: https://github.com/linuxkid473/maclator
+- CARParser: https://github.com/Timac/CARParser
+
+Third-party components retain their own licenses and attribution requirements.
+The project license does not grant rights to the original iOS applications,
+their assets, Apple SDKs, or external dependencies.

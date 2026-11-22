@@ -1,0 +1,662 @@
+ 
+#define VKD(name) ({ static PFN_##name cached; PFN_##name fn=__atomic_load_n(&cached,__ATOMIC_ACQUIRE); if (!fn) { fn=(PFN_##name)vulkan.get_device_proc(vulkan.device,#name); __atomic_store_n(&cached,fn,__ATOMIC_RELEASE); } fn; })
+static _Thread_local struct MetalCommandPool *metal_render_locked_queue;
+static void metal_render_stop(const char *reason,const char *detail) {
+    if (metal_render_locked_queue) {
+        pthread_mutex_unlock(&metal_render_locked_queue->mutex); metal_render_locked_queue=NULL;
+    }
+    stop(reason,detail);
+}
+static void metal_render_lock(struct MetalCommand *command) { pthread_mutex_lock(&command->pool_owner->mutex); metal_render_locked_queue=command->pool_owner; }
+static void metal_render_unlock(struct MetalCommand *command) { metal_render_locked_queue=NULL; pthread_mutex_unlock(&command->pool_owner->mutex); }
+struct MetalBoundBuffer { struct MetalBuffer *buffer; VkDeviceSize offset; };
+struct MetalDescriptorPoolChunk { VkDescriptorPool pool; unsigned sets,per_draw[6]; struct MetalDescriptorPoolChunk *next; };
+struct MetalDescriptorValue { uint64_t resource,offset,range; };
+struct MetalDescriptorSnapshot {
+    struct MetalPipeline *pipeline;
+    VkDescriptorSet sets[2];
+    uint64_t hash;
+    unsigned count;
+    struct MetalDescriptorSnapshot *next;
+    struct MetalDescriptorValue values[];
+};
+struct MetalRenderSnapshot { struct MetalTexture *source,*texture; unsigned generation; struct MetalRenderSnapshot *next; };
+struct MetalSnapshotCache { struct MetalTexture *texture; struct MetalSnapshotCache *next; };
+static struct MetalSnapshotCache *metal_snapshot_cache;
+static size_t metal_snapshot_cache_bytes;
+static unsigned metal_snapshot_cache_count;
+static pthread_mutex_t metal_snapshot_cache_mutex=PTHREAD_MUTEX_INITIALIZER;
+static struct MetalDescriptorPoolChunk *metal_descriptor_pool_cache;
+static unsigned metal_descriptor_pool_cache_count;
+static pthread_mutex_t metal_descriptor_pool_cache_mutex=PTHREAD_MUTEX_INITIALIZER;
+static struct MetalTexture *metal_snapshot_cached(struct MetalTexture *source) {
+    pthread_mutex_lock(&metal_snapshot_cache_mutex);
+    struct MetalSnapshotCache **slot=&metal_snapshot_cache;
+    while (*slot) {
+        struct MetalTexture *texture=(*slot)->texture;
+        if (texture->format.metal==source->format.metal && texture->type==source->type && texture->width==source->width && texture->height==source->height &&
+            texture->depth==source->depth && texture->mips==source->mips && texture->samples==source->samples && texture->array_length==source->array_length) {
+            struct MetalSnapshotCache *entry=*slot; *slot=entry->next;
+            --metal_snapshot_cache_count; metal_snapshot_cache_bytes-=texture->allocation;
+            pthread_mutex_unlock(&metal_snapshot_cache_mutex); free(entry); return texture;
+        }
+        slot=&(*slot)->next;
+    }
+    pthread_mutex_unlock(&metal_snapshot_cache_mutex); return NULL;
+}
+static void metal_snapshot_return(struct MetalTexture *texture) {
+    struct MetalSnapshotCache *entry=malloc(sizeof(*entry));
+    pthread_mutex_lock(&metal_snapshot_cache_mutex);
+    if (!entry || metal_snapshot_cache_count>=32 || texture->allocation>64*1024*1024-metal_snapshot_cache_bytes) {
+        pthread_mutex_unlock(&metal_snapshot_cache_mutex); free(entry); metal_object_release((Word)texture); return;
+    }
+    *entry=(struct MetalSnapshotCache){texture,metal_snapshot_cache}; metal_snapshot_cache=entry;
+    ++metal_snapshot_cache_count; metal_snapshot_cache_bytes+=texture->allocation;
+    pthread_mutex_unlock(&metal_snapshot_cache_mutex);
+}
+static unsigned metal_descriptor_kind_index(VkDescriptorType type) {
+    return type==VK_DESCRIPTOR_TYPE_SAMPLER ? 0 : type==VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ? 1 : type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? 2 :
+        type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ? 4 : type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC ? 5 : 3;
+}
+static struct MetalDescriptorPoolChunk *metal_descriptor_pool_acquire(const unsigned counts[6]) {
+    pthread_mutex_lock(&metal_descriptor_pool_cache_mutex);
+    struct MetalDescriptorPoolChunk **slot=&metal_descriptor_pool_cache;
+    while (*slot) {
+        if (!memcmp((*slot)->per_draw,counts,sizeof((*slot)->per_draw))) {
+            struct MetalDescriptorPoolChunk *chunk=*slot; *slot=chunk->next; --metal_descriptor_pool_cache_count;
+            pthread_mutex_unlock(&metal_descriptor_pool_cache_mutex); chunk->next=NULL; chunk->sets=0; return chunk;
+        }
+        slot=&(*slot)->next;
+    }
+    pthread_mutex_unlock(&metal_descriptor_pool_cache_mutex);
+    struct MetalDescriptorPoolChunk *chunk=calloc(1,sizeof(*chunk)); if (!chunk) return NULL;
+    memcpy(chunk->per_draw,counts,sizeof(chunk->per_draw));
+    const VkDescriptorType types[]={VK_DESCRIPTOR_TYPE_SAMPLER,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC};
+    VkDescriptorPoolSize sizes[6]; unsigned used=0;
+    for (unsigned i=0;i<COUNT(types);++i) if (counts[i]) sizes[used++]=(VkDescriptorPoolSize){types[i],32*counts[i]};
+    VkDescriptorPoolCreateInfo info={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=64,.poolSizeCount=used,.pPoolSizes=sizes};
+    if (VKD(vkCreateDescriptorPool)(vulkan.device,&info,NULL,&chunk->pool)!=VK_SUCCESS) { free(chunk); return NULL; }
+    return chunk;
+}
+static void metal_descriptor_pool_return(struct MetalDescriptorPoolChunk *chunk) {
+    VkResult result=VKD(vkResetDescriptorPool)(vulkan.device,chunk->pool,0);
+    pthread_mutex_lock(&metal_descriptor_pool_cache_mutex);
+    if (result!=VK_SUCCESS || metal_descriptor_pool_cache_count>=128) {
+        pthread_mutex_unlock(&metal_descriptor_pool_cache_mutex); VKD(vkDestroyDescriptorPool)(vulkan.device,chunk->pool,NULL); free(chunk); return;
+    }
+    chunk->sets=0; chunk->next=metal_descriptor_pool_cache; metal_descriptor_pool_cache=chunk; ++metal_descriptor_pool_cache_count;
+    pthread_mutex_unlock(&metal_descriptor_pool_cache_mutex);
+}
+struct MetalPassBundleKey {
+    VkImageViewCreateInfo views[9]; VkAttachmentDescription descriptions[9]; VkAttachmentReference colors[8],depth;
+    uint32_t color_count,attachment_count,width,height; VkFormat depth_format;
+};
+struct MetalPassBundle { struct MetalPassBundleKey key; VkImageView views[9]; VkRenderPass first_pass,load_pass; VkFramebuffer framebuffer; struct MetalPassBundle *next; };
+static pthread_mutex_t metal_pass_bundle_mutex=PTHREAD_MUTEX_INITIALIZER;
+static struct MetalPassBundle *metal_pass_bundles;
+static unsigned metal_pass_bundle_count;
+static void metal_pass_bundle_destroy(struct MetalPassBundle *entry) {
+    if (entry->framebuffer) VKD(vkDestroyFramebuffer)(vulkan.device,entry->framebuffer,NULL);
+    if (entry->first_pass) VKD(vkDestroyRenderPass)(vulkan.device,entry->first_pass,NULL);
+    if (entry->load_pass) VKD(vkDestroyRenderPass)(vulkan.device,entry->load_pass,NULL);
+    for (unsigned i=0;i<entry->key.attachment_count;++i) if (entry->views[i]) VKD(vkDestroyImageView)(vulkan.device,entry->views[i],NULL);
+    free(entry);
+}
+static void metal_pass_bundle_return(struct MetalPassBundle *entry) {
+    pthread_mutex_lock(&metal_pass_bundle_mutex);
+    if (metal_pass_bundle_count>=256) { pthread_mutex_unlock(&metal_pass_bundle_mutex); metal_pass_bundle_destroy(entry); return; }
+    entry->next=metal_pass_bundles; metal_pass_bundles=entry; ++metal_pass_bundle_count;
+    pthread_mutex_unlock(&metal_pass_bundle_mutex);
+}
+static void metal_render_cache_invalidate(struct MetalTexture *texture) {
+    /* Free-list entries have passed their consumer fence. Retire views and
+     * framebuffers before the backing image itself is destroyed. */
+    pthread_mutex_lock(&metal_pass_bundle_mutex);
+    struct MetalPassBundle **slot=&metal_pass_bundles;
+    while (*slot) {
+        struct MetalPassBundle *entry=*slot; unsigned found=0;
+        for (unsigned i=0;i<entry->key.attachment_count;++i) if (entry->key.views[i].image==texture->image) found=1;
+        if (found) { *slot=entry->next; --metal_pass_bundle_count; metal_pass_bundle_destroy(entry); }
+        else slot=&entry->next;
+    }
+    pthread_mutex_unlock(&metal_pass_bundle_mutex);
+}
+struct MetalRenderState {
+    struct MetalPipeline *pipeline;
+    struct MetalPipelineKey key;
+    struct MetalBoundBuffer buffers[2][31];
+    struct MetalTexture *textures[2][128],*attachments[9];
+    struct MetalSampler *samplers[2][16];
+    VkImageView views[9]; VkRenderPass first_pass,load_pass; VkFramebuffer framebuffer;
+    VkImageViewCreateInfo view_descriptions[9]; struct MetalPassBundle *pass_bundle;
+    VkAttachmentDescription descriptions[9]; VkAttachmentReference colors[8],depth;
+    VkClearValue clear[9]; VkViewport viewport; VkRect2D scissor;
+    uint32_t color_count,attachment_count,width,height;
+    VkFormat color_formats[8],depth_format;
+    VkSampleCountFlagBits samples;
+    unsigned begun,started,debug_depth,draws;
+    float blend[4],bias,slope,clamp;
+    uint32_t front_reference,back_reference;
+    struct MetalDescriptorPoolChunk *pools;
+    struct MetalDescriptorSnapshot *descriptors[32];
+    unsigned descriptor_count;
+    struct MetalRenderSnapshot *snapshots;
+    VkPipeline bound_pipeline;
+    struct MetalBoundBuffer bound_vertices[31];
+    VkBuffer bound_index;
+    VkDeviceSize bound_index_offset;
+    Word bound_index_type;
+    unsigned dynamic_set,stencil_dirty;
+    struct MetalRenderState *next_free;
+};
+struct MetalRenderEncoder {
+    struct MetalResource object;
+    struct MetalCommand *command;
+    struct MetalRenderState *state;
+    unsigned ended;
+    struct MetalRenderEncoder *next;
+};
+/* The ObjC identity can outlive endEncoding and completion. Only the large
+ * recording state belongs to the GPU submission; recycle it after its fence
+ * and completion handlers. Keep identity/device/label usable for the client. */
+static pthread_mutex_t metal_render_state_mutex=PTHREAD_MUTEX_INITIALIZER;
+static struct MetalRenderState *metal_render_state_free;
+static unsigned metal_render_state_count;
+static struct MetalRenderState *metal_render_state_acquire(void) {
+    pthread_mutex_lock(&metal_render_state_mutex);
+    struct MetalRenderState *state=metal_render_state_free;
+    if (state) { metal_render_state_free=state->next_free; --metal_render_state_count; }
+    pthread_mutex_unlock(&metal_render_state_mutex);
+    if (state) memset(state,0,sizeof(*state));
+    else { state=calloc(1,sizeof(*state)); if (state) metal_memory_add(3,sizeof(*state)); }
+    return state;
+}
+static void metal_render_state_return(struct MetalRenderState *state) {
+    pthread_mutex_lock(&metal_render_state_mutex);
+    if (metal_render_state_count<128) {
+        state->next_free=metal_render_state_free; metal_render_state_free=state; ++metal_render_state_count;
+        pthread_mutex_unlock(&metal_render_state_mutex);
+    } else { pthread_mutex_unlock(&metal_render_state_mutex); metal_memory_sub(3,sizeof(*state)); free(state); }
+}
+static void metal_render_check(struct MetalRenderEncoder *encoder,const char *selector) {
+    if (encoder->ended || encoder->command->active_encoder!=(Word)encoder || metal_command_status(&encoder->command->object)>=2)
+        metal_render_stop("Metal render encoder is not recording",selector);
+}
+static void metal_render_result(VkResult result,const char *operation) {
+    if (result!=VK_SUCCESS) { char detail[160]; snprintf(detail,sizeof(detail),"%s result=%d",operation,result); metal_render_stop("Vulkan render operation failed",detail); }
+}
+static void metal_render_pass_bundle(struct MetalRenderEncoder *encoder) {
+    uint64_t diagnostic=render_diagnostic_clock(); struct MetalPassBundleKey key={0};
+    memcpy(key.views,encoder->state->view_descriptions,sizeof(key.views)); memcpy(key.descriptions,encoder->state->descriptions,sizeof(key.descriptions));
+    memcpy(key.colors,encoder->state->colors,sizeof(key.colors)); key.depth=encoder->state->depth;
+    key.color_count=encoder->state->color_count; key.attachment_count=encoder->state->attachment_count; key.width=encoder->state->width; key.height=encoder->state->height; key.depth_format=encoder->state->depth_format;
+    pthread_mutex_lock(&metal_pass_bundle_mutex); struct MetalPassBundle **slot=&metal_pass_bundles,*entry=NULL;
+    while (*slot) { if (!memcmp(&(*slot)->key,&key,sizeof(key))) { entry=*slot; *slot=entry->next; --metal_pass_bundle_count; break; } slot=&(*slot)->next; }
+    pthread_mutex_unlock(&metal_pass_bundle_mutex); unsigned reused=entry!=NULL;
+    if (!entry) {
+        entry=calloc(1,sizeof(*entry)); if (!entry) metal_render_stop("Allocation failed","Render pass bundle"); entry->key=key;
+        for (unsigned i=0;i<key.attachment_count;++i) metal_render_result(VKD(vkCreateImageView)(vulkan.device,&key.views[i],NULL,&entry->views[i]),"vkCreateImageView attachment");
+        VkSubpassDescription subpass={.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS,.colorAttachmentCount=key.color_count,.pColorAttachments=key.colors,.pDepthStencilAttachment=key.depth_format ? &key.depth : NULL};
+        VkRenderPassCreateInfo info={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,.attachmentCount=key.attachment_count,.pAttachments=key.descriptions,.subpassCount=1,.pSubpasses=&subpass};
+        metal_render_result(VKD(vkCreateRenderPass)(vulkan.device,&info,NULL,&entry->first_pass),"vkCreateRenderPass first");
+        for (unsigned i=0;i<key.attachment_count;++i) { key.descriptions[i].loadOp=VK_ATTACHMENT_LOAD_OP_LOAD; if (encoder->state->attachments[i]->format.aspects&VK_IMAGE_ASPECT_STENCIL_BIT) key.descriptions[i].stencilLoadOp=VK_ATTACHMENT_LOAD_OP_LOAD; }
+        metal_render_result(VKD(vkCreateRenderPass)(vulkan.device,&info,NULL,&entry->load_pass),"vkCreateRenderPass continuation");
+        VkFramebufferCreateInfo framebuffer={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=entry->first_pass,.attachmentCount=key.attachment_count,.pAttachments=entry->views,.width=key.width,.height=key.height,.layers=1};
+        metal_render_result(VKD(vkCreateFramebuffer)(vulkan.device,&framebuffer,NULL,&entry->framebuffer),"vkCreateFramebuffer");
+    }
+    entry->next=NULL; encoder->state->pass_bundle=entry; memcpy(encoder->state->views,entry->views,sizeof(encoder->state->views));
+    encoder->state->first_pass=entry->first_pass; encoder->state->load_pass=entry->load_pass; encoder->state->framebuffer=entry->framebuffer;
+    render_diagnostic_cost(10,diagnostic);
+    static unsigned hits,misses;
+    if (render_diagnostics_requested) {
+        if (reused) __atomic_add_fetch(&hits,1,__ATOMIC_RELAXED); else __atomic_add_fetch(&misses,1,__ATOMIC_RELAXED);
+        unsigned total=__atomic_load_n(&hits,__ATOMIC_RELAXED)+__atomic_load_n(&misses,__ATOMIC_RELAXED);
+        if (total%1024==0) LOG("[DIAG-render] Render pass bundle cache: hits=%u misses=%u",__atomic_load_n(&hits,__ATOMIC_RELAXED),__atomic_load_n(&misses,__ATOMIC_RELAXED));
+    }
+}
+static void metal_render_close_pass(struct MetalRenderEncoder *encoder) {
+    if (encoder->state->begun) { VKD(vkCmdEndRenderPass)(encoder->command->command); encoder->state->begun=0; }
+}
+static void metal_render_transition(struct MetalRenderEncoder *encoder,struct MetalTexture *texture,VkImageLayout layout,VkAccessFlags access) {
+    struct MetalCommandTexture *use=metal_command_texture(encoder->command,texture);
+    if (!use->layout_used) {
+        use->layout_used=1;
+         
+        use->initial=use->layout=layout; use->initial_access=access;
+#if I2A_DEVELOPMENT
+        if (metal_diagnostic_enabled) __atomic_fetch_add(&metal_layout_counts[0],1,__ATOMIC_RELAXED);
+#endif
+        return;
+    }
+    if (use->layout==layout) return;
+    metal_render_close_pass(encoder);
+    VkImageMemoryBarrier barrier={.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask=use->layout==VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask=access,.oldLayout=use->layout,.newLayout=layout,.srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,
+        .image=texture->image,.subresourceRange={texture->format.aspects,0,(uint32_t)texture->mips,0,(uint32_t)texture->layers}};
+    VKD(vkCmdPipelineBarrier)(encoder->command->command,use->layout==VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,NULL,0,NULL,1,&barrier);
+    use->layout=layout;
+}
+static void metal_render_begin(struct MetalRenderEncoder *encoder) {
+    if (encoder->state->begun) return;
+    for (unsigned i=0;i<encoder->state->attachment_count;++i) {
+        struct MetalTexture *texture=encoder->state->attachments[i];
+        VkImageLayout layout=texture->format.aspects==VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        metal_render_transition(encoder,texture,layout,texture->format.aspects==VK_IMAGE_ASPECT_COLOR_BIT ? VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+    }
+    VkRenderPassBeginInfo begin={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=encoder->state->started ? encoder->state->load_pass : encoder->state->first_pass,
+        .framebuffer=encoder->state->framebuffer,.renderArea={{0,0},{encoder->state->width,encoder->state->height}},.clearValueCount=encoder->state->attachment_count,.pClearValues=encoder->state->clear};
+    VKD(vkCmdBeginRenderPass)(encoder->command->command,&begin,VK_SUBPASS_CONTENTS_INLINE);
+#if I2A_DEVELOPMENT
+    if (metal_diagnostic_enabled) __atomic_fetch_add(&metal_layout_counts[1],1,__ATOMIC_RELAXED);
+#endif
+    encoder->state->begun=encoder->state->started=1;
+}
+static unsigned metal_render_attachment(struct MetalRenderEncoder *encoder,struct MetalDescriptor *descriptor,int is_depth) {
+    struct MetalTexture *texture=(void *)metal_property(descriptor,"texture");
+    if (!texture || texture->object.isa!=external_class("_OBJC_CLASS_$_I2AMetalTexture")) metal_render_stop("Invalid render attachment texture","renderCommandEncoderWithDescriptor:");
+    Word level=metal_property(descriptor,"level"),slice=metal_property(descriptor,"slice"),plane=metal_property(descriptor,"depthPlane");
+    Word load=metal_property(descriptor,"loadAction"),store=metal_property(descriptor,"storeAction");
+    if (level>=texture->mips || slice>=texture->layers || plane || texture->type==7 || load>2 || store>1 || metal_property(descriptor,"resolveTexture") ||
+        texture->samples!=1 || !(texture->native_usage&(is_depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)))
+        metal_render_stop("Unsupported render attachment subresource, resolve or action","renderCommandEncoderWithDescriptor:");
+    uint32_t width=(uint32_t)(texture->width>>level),height=(uint32_t)(texture->height>>level);
+    if (!width) width=1; if (!height) height=1;
+    if (width<encoder->state->width) encoder->state->width=width; if (height<encoder->state->height) encoder->state->height=height;
+    unsigned index=encoder->state->attachment_count++;
+    encoder->state->attachments[index]=texture; encoder->state->samples=(VkSampleCountFlagBits)texture->samples;
+     
+    metal_command_texture(encoder->command,texture);
+    VkImageViewCreateInfo view={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=texture->image,.viewType=VK_IMAGE_VIEW_TYPE_2D,.format=texture->format.format,
+        .subresourceRange={texture->format.aspects,(uint32_t)level,1,(uint32_t)slice,1}};
+    encoder->state->view_descriptions[index]=view;
+    const VkAttachmentLoadOp loads[]={VK_ATTACHMENT_LOAD_OP_DONT_CARE,VK_ATTACHMENT_LOAD_OP_LOAD,VK_ATTACHMENT_LOAD_OP_CLEAR};
+    VkImageLayout layout=is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    encoder->state->descriptions[index]=(VkAttachmentDescription){.format=texture->format.format,.samples=encoder->state->samples,
+        .loadOp=loads[load],.storeOp=VK_ATTACHMENT_STORE_OP_STORE,.stencilLoadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .stencilStoreOp=VK_ATTACHMENT_STORE_OP_STORE,.initialLayout=layout,.finalLayout=layout};
+    if (is_depth) encoder->state->clear[index].depthStencil=(VkClearDepthStencilValue){(float)descriptor->clear_depth,(uint32_t)metal_property(descriptor,"clearStencil")};
+    else for (unsigned i=0;i<4;++i) encoder->state->clear[index].color.float32[i]=(float)descriptor->clear_color[i];
+     
+    return index;
+}
+static Word metal_render_encoder(struct MetalCommand *command,const char *selector,struct MetalDescriptor *descriptor) {
+    if (!descriptor || descriptor->kind!=MD_PASS) metal_render_stop("Invalid Metal render-pass descriptor",selector);
+    struct MetalRenderEncoder *encoder=calloc(1,sizeof(*encoder)); if (!encoder) return 0;
+    encoder->state=metal_render_state_acquire();
+    if (!encoder->state) { free(encoder); return 0; }
+    metal_memory_add(3,sizeof(*encoder));
+    encoder->object=(struct MetalResource){.isa=external_class("_OBJC_CLASS_$_I2AMetalRenderCommandEncoder"),.device=metal_command_device(&command->object)};
+    encoder->command=command; encoder->state->width=encoder->state->height=UINT32_MAX; encoder->state->samples=VK_SAMPLE_COUNT_1_BIT;
+    encoder->state->key=(struct MetalPipelineKey){.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,.front=VK_FRONT_FACE_CLOCKWISE,.polygon=VK_POLYGON_MODE_FILL};
+    encoder->state->depth=(VkAttachmentReference){VK_ATTACHMENT_UNUSED,VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    pthread_mutex_lock(&command->mutex);
+    if (command->object.content[1]>=2 || command->active_encoder) { pthread_mutex_unlock(&command->mutex); metal_render_state_return(encoder->state); metal_memory_sub(3,sizeof(*encoder)); free(encoder); metal_render_stop("Command cannot create a render encoder",selector); }
+    command->active_encoder=(Word)encoder; encoder->next=command->render_encoders; command->render_encoders=encoder;
+    pthread_mutex_unlock(&command->mutex);
+    struct MetalDescriptorArray *colors=(void *)descriptor->colors;
+    for (unsigned i=0;i<8;++i) {
+        encoder->state->colors[i]=(VkAttachmentReference){VK_ATTACHMENT_UNUSED,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        struct MetalDescriptor *color=colors && i<colors->count ? (void *)colors->items[i] : NULL;
+        if (!color || !metal_property(color,"texture")) continue;
+        unsigned index=metal_render_attachment(encoder,color,0);
+        encoder->state->colors[i].attachment=index; encoder->state->color_formats[i]=encoder->state->attachments[index]->format.format; encoder->state->color_count=i+1;
+    }
+    struct MetalDescriptor *depth=(void *)descriptor->depth,*stencil=(void *)descriptor->stencil;
+    struct MetalTexture *depth_texture=depth ? (void *)metal_property(depth,"texture") : NULL,*stencil_texture=stencil ? (void *)metal_property(stencil,"texture") : NULL;
+    if (depth_texture && stencil_texture && depth_texture!=stencil_texture) metal_render_stop("Separate depth/stencil render attachments require conversion",selector);
+    if (depth_texture || stencil_texture) {
+        unsigned index=metal_render_attachment(encoder,depth_texture ? depth : stencil,1);
+        encoder->state->depth.attachment=index; encoder->state->depth_format=encoder->state->attachments[index]->format.format;
+        if (stencil_texture) {
+            Word load=metal_property(stencil,"loadAction");
+            if (load>2 || metal_property(stencil,"storeAction")>1 || metal_property(stencil,"level")!=metal_property(depth_texture ? depth : stencil,"level") ||
+                metal_property(stencil,"slice")!=metal_property(depth_texture ? depth : stencil,"slice")) metal_render_stop("Unsupported stencil action or subresource",selector);
+            const VkAttachmentLoadOp loads[]={VK_ATTACHMENT_LOAD_OP_DONT_CARE,VK_ATTACHMENT_LOAD_OP_LOAD,VK_ATTACHMENT_LOAD_OP_CLEAR};
+            encoder->state->descriptions[index].stencilLoadOp=loads[load]; encoder->state->clear[index].depthStencil.stencil=(uint32_t)metal_property(stencil,"clearStencil");
+        }
+    }
+    if (!encoder->state->attachment_count) { encoder->state->width=encoder->state->height=1; }
+    metal_render_pass_bundle(encoder);
+    encoder->state->viewport=(VkViewport){0,0,(float)encoder->state->width,(float)encoder->state->height,0,1}; encoder->state->scissor=(VkRect2D){{0,0},{encoder->state->width,encoder->state->height}};
+    static unsigned logged;
+    if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<32) LOG("Vulkan render encoder ready: %ux%u colorSlots=%u attachments=%u",encoder->state->width,encoder->state->height,encoder->state->color_count,encoder->state->attachment_count);
+    return (Word)encoder;
+}
+static void metal_render_end(struct MetalRenderEncoder *encoder,const char *selector) {
+    metal_render_check(encoder,selector); metal_render_lock(encoder->command);
+    metal_render_begin(encoder); metal_render_close_pass(encoder);
+    metal_diagnostic_capture(encoder);
+    VkMemoryBarrier barrier={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+        .dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT};
+    VKD(vkCmdPipelineBarrier)(encoder->command->command,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&barrier,0,NULL,0,NULL);
+    metal_render_unlock(encoder->command); encoder->ended=1; encoder->command->active_encoder=0; ++encoder->command->recorded_operations;
+}
+static void metal_render_pipeline(struct MetalRenderEncoder *encoder,const char *selector,struct MetalPipeline *pipeline) {
+    metal_render_check(encoder,selector);
+    if (!pipeline || pipeline->object.isa!=external_class("_OBJC_CLASS_$_I2AMetalRenderPipelineState")) metal_render_stop("Invalid render pipeline state",selector);
+    if (pipeline->color_count!=encoder->state->color_count || pipeline->depth_format!=encoder->state->depth_format || pipeline->samples!=encoder->state->samples ||
+        memcmp(pipeline->colors,encoder->state->color_formats,sizeof(pipeline->colors))) metal_render_stop("Render pipeline and attachments are incompatible",selector);
+    if (encoder->state->pipeline!=pipeline) metal_command_use(encoder->command,(Word)pipeline);
+    encoder->state->pipeline=pipeline;
+}
+static void metal_render_state(struct MetalRenderEncoder *encoder,const char *selector,Word value) {
+    metal_render_check(encoder,selector);
+    if (!strcmp(selector,"setDepthStencilState:")) {
+        if (value && read_word(value)!=external_class("_OBJC_CLASS_$_I2AMetalDepthStencilState")) metal_render_stop("Invalid depth/stencil state",selector);
+        if (value && encoder->state->key.depth!=(void *)value) metal_command_use(encoder->command,value);
+        encoder->state->key.depth=(void *)value; return;
+    }
+    if (!strcmp(selector,"setCullMode:")) { if (value>2) metal_render_stop("Invalid cull mode",selector); encoder->state->key.cull=(VkCullModeFlags)value; }
+    else if (!strcmp(selector,"setFrontFacingWinding:")) { if (value>1) metal_render_stop("Invalid front winding",selector); encoder->state->key.front=value ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE; }
+    else if (!strcmp(selector,"setTriangleFillMode:")) { if (value>1 || (value && !vulkan.features.fillModeNonSolid)) metal_render_stop("Unsupported triangle fill",selector); encoder->state->key.polygon=value ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL; }
+    else { if (value>1 || (value && !vulkan.features.depthClamp)) metal_render_stop("Unsupported depth clipping",selector); encoder->state->key.clamp=(unsigned)value; }
+}
+static void metal_render_buffer(struct MetalRenderEncoder *encoder,const char *selector,struct MetalBuffer *buffer,size_t offset,Word index) {
+    metal_render_check(encoder,selector);
+    if (index>=31 || (buffer && (buffer->object.isa!=external_class("_OBJC_CLASS_$_I2AMetalBuffer") || offset>buffer->length))) metal_render_stop("Invalid render buffer binding",selector);
+    unsigned stage_index=strstr(selector,"Fragment")!=NULL;
+    if (buffer && encoder->state->buffers[stage_index][index].buffer!=buffer) metal_command_use(encoder->command,(Word)buffer);
+    encoder->state->buffers[stage_index][index]=(struct MetalBoundBuffer){buffer,offset};
+}
+static void metal_render_texture(struct MetalRenderEncoder *encoder,const char *selector,struct MetalTexture *texture,Word index) {
+    metal_render_check(encoder,selector);
+    if (index>=128 || (texture && (texture->object.isa!=external_class("_OBJC_CLASS_$_I2AMetalTexture") || !(texture->native_usage&VK_IMAGE_USAGE_SAMPLED_BIT)))) metal_render_stop("Invalid render texture binding",selector);
+    encoder->state->textures[strstr(selector,"Fragment")!=NULL][index]=texture;
+    if (texture) metal_command_texture(encoder->command,texture);
+}
+static void metal_render_sampler(struct MetalRenderEncoder *encoder,const char *selector,struct MetalSampler *sampler,Word index) {
+    metal_render_check(encoder,selector);
+    if (index>=16 || (sampler && sampler->object.isa!=external_class("_OBJC_CLASS_$_I2AMetalSamplerState"))) metal_render_stop("Invalid render sampler binding",selector);
+    unsigned stage_index=strstr(selector,"Fragment")!=NULL;
+    if (sampler && encoder->state->samplers[stage_index][index]!=sampler) metal_command_use(encoder->command,(Word)sampler);
+    encoder->state->samplers[stage_index][index]=sampler;
+}
+static int metal_render_feedback(struct MetalRenderEncoder *encoder,struct MetalTexture *texture) {
+    for (unsigned i=0;i<encoder->state->attachment_count;++i) if (texture==encoder->state->attachments[i]) return 1;
+    return 0;
+}
+static void metal_render_prepare_snapshots(struct MetalRenderEncoder *encoder) {
+    for (unsigned stage_index=0;stage_index<2;++stage_index) {
+        struct MetalFunction *function=stage_index ? encoder->state->pipeline->fragment : encoder->state->pipeline->vertex;
+        for (unsigned i=0;function && i<function->spec->binding_count;++i) {
+            const struct ShaderBindingSpec *binding=&shader_bindings[function->spec->first_binding+i];
+            if (binding->type!=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || binding->metal_index>=128) continue;
+            struct MetalTexture *source=encoder->state->textures[stage_index][binding->metal_index];
+            if (!source || !metal_render_feedback(encoder,source)) continue;
+            struct MetalRenderSnapshot *snapshot=encoder->state->snapshots;
+            while (snapshot && snapshot->source!=source) snapshot=snapshot->next;
+            if (snapshot) continue;
+            snapshot=calloc(1,sizeof(*snapshot)); if (!snapshot) metal_render_stop("Allocation failed","Render feedback snapshot");
+            struct MetalDescriptor *description=(void *)metal_descriptor_create(MD_TEXTURE);
+            const char *names[]={"pixelFormat","textureType","width","height","depth","mipmapLevelCount","sampleCount","arrayLength","usage","resourceOptions"};
+            Word values[]={source->format.metal,source->type,source->width,source->height,source->depth,source->mips,source->samples,source->array_length,1,0x20};
+            for (unsigned j=0;j<COUNT(names);++j) metal_property_assign(description,names[j],values[j]);
+            snapshot->source=source; snapshot->texture=metal_snapshot_cached(source);
+            int reused=snapshot->texture!=NULL;
+            if (!snapshot->texture) snapshot->texture=(void *)metal_texture_new(source->object.device,"Render feedback snapshot",description);
+            metal_object_release((Word)description);
+            if (!snapshot->texture) { free(snapshot); metal_render_stop("Cannot allocate native attachment snapshot",function->spec->name); }
+            snapshot->generation=UINT_MAX; snapshot->next=encoder->state->snapshots; encoder->state->snapshots=snapshot;
+            metal_command_texture(encoder->command,snapshot->texture);
+            static unsigned logged;
+            if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<24) LOG("Vulkan attachment snapshot %s: %s texture=%u %lux%lu aspects=0x%x",reused ? "reused" : "allocated",function->spec->name,binding->metal_index,source->width,source->height,source->format.aspects);
+        }
+    }
+}
+static struct MetalTexture *metal_render_snapshot(struct MetalRenderEncoder *encoder,struct MetalTexture *source) {
+    struct MetalRenderSnapshot *snapshot=encoder->state->snapshots;
+    while (snapshot && snapshot->source!=source) snapshot=snapshot->next;
+    if (!snapshot) metal_render_stop("Missing prepared attachment snapshot","draw");
+    if (snapshot->generation==encoder->state->draws) return snapshot->texture;
+     
+    metal_render_begin(encoder); metal_render_close_pass(encoder);
+    metal_render_transition(encoder,source,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_ACCESS_TRANSFER_READ_BIT);
+    metal_render_transition(encoder,snapshot->texture,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_ACCESS_TRANSFER_WRITE_BIT);
+    for (uint32_t level=0;level<source->mips;++level) {
+        uint32_t width=(uint32_t)(source->width>>level),height=(uint32_t)(source->height>>level),depth=(uint32_t)(source->depth>>level);
+        if (!width) width=1; if (!height) height=1; if (!depth) depth=1;
+        for (unsigned aspect=1;aspect<=VK_IMAGE_ASPECT_STENCIL_BIT;aspect<<=1) if (source->format.aspects&aspect) {
+            VkImageCopy copy={.srcSubresource={aspect,level,0,(uint32_t)source->layers},.dstSubresource={aspect,level,0,(uint32_t)source->layers},.extent={width,height,depth}};
+            VKD(vkCmdCopyImage)(encoder->command->command,source->image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,snapshot->texture->image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copy);
+        }
+    }
+    metal_render_transition(encoder,snapshot->texture,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_ACCESS_SHADER_READ_BIT);
+    snapshot->generation=encoder->state->draws; ++encoder->command->recorded_operations;
+    return snapshot->texture;
+}
+static void metal_render_descriptors(struct MetalRenderEncoder *encoder) {
+    struct MetalPipeline *pipeline=encoder->state->pipeline;
+    uint32_t dynamic_offsets[128]={0};
+    if (pipeline->dynamic_count>COUNT(dynamic_offsets)) metal_render_stop("Graphics dynamic descriptor count exceeds backend capacity","draw");
+    unsigned stages[128]; struct MetalDescriptorValue values[128];
+    VkWriteDescriptorSet writes[128]; VkDescriptorBufferInfo buffer_infos[128]; VkDescriptorImageInfo image_infos[128]; unsigned write_count=0;
+    for (unsigned stage_index=0;stage_index<2;++stage_index) {
+        struct MetalFunction *function=stage_index ? encoder->state->pipeline->fragment : encoder->state->pipeline->vertex;
+        for (unsigned i=0;function && i<function->spec->binding_count;++i) {
+            const struct ShaderBindingSpec *binding=&shader_bindings[function->spec->first_binding+i];
+            if (binding->sampler_bits) continue;
+            if (write_count>=COUNT(writes)) metal_render_stop("Graphics descriptor count exceeds backend capacity",function->spec->name);
+            VkDescriptorBufferInfo *buffer_info=&buffer_infos[write_count]; VkDescriptorImageInfo *image_info=&image_infos[write_count];
+            *buffer_info=(VkDescriptorBufferInfo){0}; *image_info=(VkDescriptorImageInfo){0};
+            VkWriteDescriptorSet write={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstBinding=binding->binding,
+                .descriptorCount=1,.descriptorType=metal_pipeline_binding_type(pipeline,binding->type)};
+            if (binding->type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && binding->metal_index==UINT32_MAX-1) {
+                struct MetalBuffer *diagnostic=metal_math_buffer(encoder->command);
+                *buffer_info=(VkDescriptorBufferInfo){diagnostic->buffer,0,diagnostic->length}; write.pBufferInfo=buffer_info;
+            } else if (binding->type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || binding->type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+                if (binding->metal_index>=31) metal_render_stop("Invalid shader buffer index",function->spec->name);
+                struct MetalBoundBuffer *use=&encoder->state->buffers[stage_index][binding->metal_index];
+                VkDeviceSize alignment=binding->type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? vulkan.properties.limits.minUniformBufferOffsetAlignment : vulkan.properties.limits.minStorageBufferOffsetAlignment;
+                if (!use->buffer || use->offset>use->buffer->length || !binding->size || binding->metal_size>use->buffer->length-use->offset ||
+                    binding->size>use->buffer->native_length-use->offset || use->offset%alignment) {
+                    char detail[240]; snprintf(detail,sizeof(detail),"%s buffer=%u offset=%llu metalSize=%u vkRange=%u length=%zu nativeLength=%zu alignment=%llu",function->spec->name,binding->metal_index,
+                        (unsigned long long)use->offset,binding->metal_size,binding->size,use->buffer ? use->buffer->length : 0,use->buffer ? use->buffer->native_length : 0,
+                        (unsigned long long)alignment); metal_render_stop("Missing, undersized or unaligned shader buffer",detail);
+                }
+                *buffer_info=(VkDescriptorBufferInfo){use->buffer->buffer,use->offset,binding->size}; write.pBufferInfo=buffer_info;
+                unsigned slot=pipeline->dynamic_slots[stage_index][i];
+                if (slot && use->offset<=UINT32_MAX) {
+                    dynamic_offsets[slot-1]=(uint32_t)use->offset; buffer_info->offset=0;
+                }
+                 
+#if I2A_DEVELOPMENT
+                if (metal_diagnostic_readback && runtime_extension.shader_buffer_diagnostic && use->buffer->mapped) {
+                    float viewport[]={encoder->state->viewport.x,encoder->state->viewport.y,encoder->state->viewport.width,encoder->state->viewport.height};
+                    runtime_extension.shader_buffer_diagnostic(function->spec->name,(char *)use->buffer->mapped+use->offset,binding->metal_size,viewport);
+                }
+#endif
+            } else if (binding->type==VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
+                struct MetalTexture *texture=binding->metal_index<128 ? encoder->state->textures[stage_index][binding->metal_index] : NULL;
+                if (!texture) metal_render_stop("Missing active shader texture",function->spec->name);
+                if (metal_render_feedback(encoder,texture)) texture=metal_render_snapshot(encoder,texture);
+                metal_render_transition(encoder,texture,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_ACCESS_SHADER_READ_BIT);
+                *image_info=(VkDescriptorImageInfo){VK_NULL_HANDLE,texture->sampled_view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}; write.pImageInfo=image_info;
+            } else if (binding->type==VK_DESCRIPTOR_TYPE_SAMPLER) {
+                struct MetalSampler *sampler=binding->metal_index<16 ? encoder->state->samplers[stage_index][binding->metal_index] : NULL;
+                if (!sampler) metal_render_stop("Missing active shader sampler",function->spec->name);
+                image_info->sampler=sampler->sampler; write.pImageInfo=image_info;
+            } else metal_render_stop("Unsupported graphics descriptor type",function->spec->name);
+            values[write_count]=write.pBufferInfo ?
+                (struct MetalDescriptorValue){(uint64_t)(uintptr_t)buffer_info->buffer,buffer_info->offset,buffer_info->range} :
+                (struct MetalDescriptorValue){binding->type==VK_DESCRIPTOR_TYPE_SAMPLER ? (uint64_t)(uintptr_t)image_info->sampler : (uint64_t)(uintptr_t)image_info->imageView,0,0};
+            stages[write_count]=stage_index; writes[write_count++]=write;
+        }
+    }
+    /* Descriptor snapshots are immutable until this command's fence completes.
+     * Binding offsets travel with the draw; textures still perform their normal
+     * transitions and feedback copies even when their descriptor set is reused. */
+    uint64_t hash=(uint64_t)(uintptr_t)pipeline;
+    for (unsigned i=0;i<write_count;++i) {
+        hash=(hash^values[i].resource)*UINT64_C(1099511628211);
+        hash=(hash^values[i].offset)*UINT64_C(1099511628211);
+        hash=(hash^values[i].range)*UINT64_C(1099511628211);
+    }
+    unsigned bucket=(unsigned)hash&(COUNT(encoder->state->descriptors)-1);
+    struct MetalDescriptorSnapshot *snapshot=encoder->state->descriptors[bucket];
+    while (snapshot && (snapshot->hash!=hash || snapshot->pipeline!=pipeline || snapshot->count!=write_count ||
+        memcmp(snapshot->values,values,write_count*sizeof(*values)))) snapshot=snapshot->next;
+#if I2A_DEVELOPMENT
+    if (metal_diagnostic_enabled) __atomic_fetch_add(&metal_descriptor_cache_counts[snapshot ? 0 : 1],1,__ATOMIC_RELAXED);
+#endif
+    VkDescriptorSet sets[2];
+    if (snapshot) memcpy(sets,snapshot->sets,sizeof(sets));
+    else {
+        unsigned counts[6]={0};
+        for (unsigned stage_index=0;stage_index<2;++stage_index) {
+            struct MetalFunction *function=stage_index ? pipeline->fragment : pipeline->vertex;
+            for (unsigned i=0;function && i<function->spec->binding_count;++i)
+                ++counts[metal_descriptor_kind_index(metal_pipeline_binding_type(pipeline,shader_bindings[function->spec->first_binding+i].type))];
+        }
+        struct MetalDescriptorPoolChunk *chunk=encoder->state->pools;
+        int fits=chunk && chunk->sets<64;
+        for (unsigned i=0;i<COUNT(counts);++i) if (chunk && counts[i]>chunk->per_draw[i]) fits=0;
+        if (!fits) {
+            chunk=metal_descriptor_pool_acquire(counts); if (!chunk) metal_render_stop("Allocation failed","Render descriptor pool");
+            chunk->next=encoder->state->pools; encoder->state->pools=chunk;
+        }
+        VkDescriptorSetAllocateInfo allocate={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=chunk->pool,
+            .descriptorSetCount=2,.pSetLayouts=pipeline->sets};
+        metal_render_result(VKD(vkAllocateDescriptorSets)(vulkan.device,&allocate,sets),"vkAllocateDescriptorSets"); chunk->sets+=2;
+        for (unsigned i=0;i<write_count;++i) writes[i].dstSet=sets[stages[i]];
+        if (write_count) VKD(vkUpdateDescriptorSets)(vulkan.device,write_count,writes,0,NULL);
+        if (encoder->state->descriptor_count<128) {
+            size_t bytes=sizeof(struct MetalDescriptorSnapshot)+write_count*sizeof(*values);
+            struct MetalDescriptorSnapshot *entry=malloc(bytes);
+            if (entry) {
+                *entry=(struct MetalDescriptorSnapshot){.pipeline=pipeline,.sets={sets[0],sets[1]},.hash=hash,.count=write_count,.next=encoder->state->descriptors[bucket]};
+                memcpy(entry->values,values,write_count*sizeof(*values));
+                encoder->state->descriptors[bucket]=entry; ++encoder->state->descriptor_count; metal_memory_add(3,bytes);
+            }
+        }
+    }
+    if (!encoder->state->pipeline->compute_fallback) metal_render_begin(encoder);
+    VKD(vkCmdBindDescriptorSets)(encoder->command->command,pipeline->compute_fallback ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline->layout,0,2,sets,pipeline->dynamic_count,dynamic_offsets);
+}
+static void metal_render_prepare_draw(struct MetalRenderEncoder *encoder,Word primitive) {
+    uint64_t diagnostic_start=metal_diagnostic_time();
+    const VkPrimitiveTopology topologies[]={VK_PRIMITIVE_TOPOLOGY_POINT_LIST,VK_PRIMITIVE_TOPOLOGY_LINE_LIST,VK_PRIMITIVE_TOPOLOGY_LINE_STRIP,
+        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP};
+    if (!encoder->state->pipeline || primitive>=COUNT(topologies)) metal_render_stop("Missing render pipeline or invalid primitive","draw");
+    encoder->state->key.topology=topologies[primitive]; VkPipeline pipeline;
+    metal_render_result(metal_pipeline_variant(encoder->state->pipeline,&encoder->state->key,&pipeline),"vkCreateGraphicsPipelines draw variant");
+    uint64_t diagnostic_pipeline=metal_diagnostic_time();
+    metal_render_descriptors(encoder);
+    uint64_t diagnostic_descriptors=metal_diagnostic_time();
+    if (diagnostic_start) {
+        metal_diagnostic_add(0,diagnostic_pipeline-diagnostic_start);
+        metal_diagnostic_add(1,diagnostic_descriptors-diagnostic_pipeline);
+    }
+    VkCommandBuffer command=encoder->command->command;
+    if (encoder->state->bound_pipeline!=pipeline) { VKD(vkCmdBindPipeline)(command,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline); encoder->state->bound_pipeline=pipeline; }
+    for (unsigned i=0;i<encoder->state->pipeline->binding_count;++i) {
+        uint32_t index=encoder->state->pipeline->bindings[i].binding; struct MetalBoundBuffer *use=&encoder->state->buffers[0][index];
+        if (!use->buffer || use->offset>=use->buffer->length) metal_render_stop("Missing active vertex buffer",encoder->state->pipeline->vertex->spec->name);
+        if (encoder->state->bound_vertices[index].buffer!=use->buffer || encoder->state->bound_vertices[index].offset!=use->offset) {
+            VKD(vkCmdBindVertexBuffers)(command,index,1,&use->buffer->buffer,&use->offset); encoder->state->bound_vertices[index]=*use;
+        }
+    }
+    if (!encoder->state->dynamic_set) {
+        VKD(vkCmdSetViewport)(command,0,1,&encoder->state->viewport); VKD(vkCmdSetScissor)(command,0,1,&encoder->state->scissor);
+        VKD(vkCmdSetBlendConstants)(command,encoder->state->blend); VKD(vkCmdSetDepthBias)(command,encoder->state->bias,encoder->state->clamp,encoder->state->slope);
+    }
+    if (!encoder->state->dynamic_set || encoder->state->stencil_dirty) {
+        VKD(vkCmdSetStencilReference)(command,VK_STENCIL_FACE_FRONT_BIT,encoder->state->front_reference); VKD(vkCmdSetStencilReference)(command,VK_STENCIL_FACE_BACK_BIT,encoder->state->back_reference);
+        encoder->state->stencil_dirty=0;
+    }
+    encoder->state->dynamic_set=1;
+}
+static void metal_render_draw(struct MetalRenderEncoder *encoder,const char *selector,Word primitive,size_t start,size_t count) {
+    metal_render_check(encoder,selector); if (start>UINT32_MAX || count>UINT32_MAX) metal_render_stop("Vertex draw range exceeds Vulkan limits",selector);
+    if (!encoder->state->pipeline) metal_render_stop("Missing render pipeline",selector);
+    if (encoder->state->pipeline->compute_fallback) {
+        if (start || count!=1 || primitive!=0) metal_render_stop("Unexpected compute substitution range",selector);
+        metal_render_lock(encoder->command); metal_render_close_pass(encoder);
+        metal_render_descriptors(encoder);
+        VkMemoryBarrier barrier={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT};
+        VKD(vkCmdPipelineBarrier)(encoder->command->command,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&barrier,0,NULL,0,NULL);
+        VKD(vkCmdBindPipeline)(encoder->command->command,VK_PIPELINE_BIND_POINT_COMPUTE,encoder->state->pipeline->compute_fallback);
+        VKD(vkCmdDispatch)(encoder->command->command,1,1,1);
+        barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT|VK_ACCESS_HOST_READ_BIT;
+        VKD(vkCmdPipelineBarrier)(encoder->command->command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT|VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,NULL,0,NULL);
+        metal_render_unlock(encoder->command); ++encoder->state->draws; ++encoder->command->recorded_operations;
+        static unsigned logged; if (!logged++) LOG("Verified non-rasterizing vertex executed as one compute invocation");
+        return;
+    }
+    metal_render_prepare_snapshots(encoder);
+    metal_render_lock(encoder->command);
+    metal_render_prepare_draw(encoder,primitive); VKD(vkCmdDraw)(encoder->command->command,(uint32_t)count,1,(uint32_t)start,0);
+    metal_render_unlock(encoder->command); ++encoder->state->draws; ++encoder->command->recorded_operations;
+    static unsigned logged; if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<32) LOG("Vulkan draw recorded: %s vertices=%zu",encoder->state->pipeline->vertex->spec->name,count);
+}
+static void metal_render_draw_indexed_instances(struct MetalRenderEncoder *encoder,const char *selector,Word primitive,size_t count,Word type,struct MetalBuffer *buffer,size_t offset,size_t instances) {
+    metal_render_check(encoder,selector); size_t element=type ? 4 : 2;
+    if (type>1 || !buffer || buffer->object.isa!=external_class("_OBJC_CLASS_$_I2AMetalBuffer") || offset>buffer->length || offset%element || count>(buffer->length-offset)/element || count>UINT32_MAX || instances>UINT32_MAX)
+        metal_render_stop("Invalid index buffer or draw range",selector);
+    if (!encoder->state->pipeline) metal_render_stop("Missing render pipeline",selector);
+    if (encoder->state->bound_index!=buffer->buffer) metal_command_use(encoder->command,(Word)buffer);
+    metal_render_prepare_snapshots(encoder);
+    metal_render_lock(encoder->command);
+    metal_render_prepare_draw(encoder,primitive);
+    if (encoder->state->bound_index!=buffer->buffer || encoder->state->bound_index_offset!=offset || encoder->state->bound_index_type!=type) {
+        VKD(vkCmdBindIndexBuffer)(encoder->command->command,buffer->buffer,offset,type ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
+        encoder->state->bound_index=buffer->buffer; encoder->state->bound_index_offset=offset; encoder->state->bound_index_type=type;
+    }
+    VKD(vkCmdDrawIndexed)(encoder->command->command,(uint32_t)count,(uint32_t)instances,0,0,0);
+    metal_render_unlock(encoder->command); ++encoder->state->draws; ++encoder->command->recorded_operations;
+    static unsigned logged; if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<32) LOG("Vulkan indexed draw recorded: %s indices=%zu instances=%zu",encoder->state->pipeline->vertex->spec->name,count,instances);
+}
+static void metal_render_draw_indexed(struct MetalRenderEncoder *encoder,const char *selector,Word primitive,size_t count,Word type,struct MetalBuffer *buffer,size_t offset) {
+    metal_render_draw_indexed_instances(encoder,selector,primitive,count,type,buffer,offset,1);
+}
+static void metal_render_stencil(struct MetalRenderEncoder *encoder,const char *selector,uint32_t front,uint32_t back) {
+    metal_render_check(encoder,selector); if (encoder->state->front_reference!=front || encoder->state->back_reference!=back) encoder->state->stencil_dirty=1;
+    encoder->state->front_reference=front; encoder->state->back_reference=back;
+}
+static void metal_render_debug_push(struct MetalRenderEncoder *encoder,const char *selector,Word name) { metal_render_check(encoder,selector); if (!name) metal_render_stop("Nil render debug group",selector); ++encoder->state->debug_depth; }
+static void metal_render_debug_pop(struct MetalRenderEncoder *encoder,const char *selector) { metal_render_check(encoder,selector); if (!encoder->state->debug_depth) metal_render_stop("Unbalanced render debug group",selector); --encoder->state->debug_depth; }
+static void metal_render_cleanup(struct MetalCommand *command) {
+    /* Command objects remain addressable by completion blocks; transient native
+     * rendering objects are released only after their real GPU fence finishes. */
+    for (struct MetalRenderEncoder *encoder=command->render_encoders;encoder;encoder=encoder->next) {
+        if (encoder->state->pass_bundle) { metal_pass_bundle_return(encoder->state->pass_bundle); encoder->state->pass_bundle=NULL; }
+        encoder->state->framebuffer=VK_NULL_HANDLE; encoder->state->first_pass=encoder->state->load_pass=VK_NULL_HANDLE;
+        memset(encoder->state->views,0,sizeof(encoder->state->views));
+        for (unsigned i=0;i<COUNT(encoder->state->descriptors);++i) {
+            struct MetalDescriptorSnapshot *entry=encoder->state->descriptors[i];
+            while (entry) {
+                struct MetalDescriptorSnapshot *next=entry->next;
+                metal_memory_sub(3,sizeof(*entry)+entry->count*sizeof(*entry->values)); free(entry); entry=next;
+            }
+        }
+        while (encoder->state->pools) { struct MetalDescriptorPoolChunk *chunk=encoder->state->pools; encoder->state->pools=chunk->next; metal_descriptor_pool_return(chunk); }
+        while (encoder->state->snapshots) { struct MetalRenderSnapshot *snapshot=encoder->state->snapshots; encoder->state->snapshots=snapshot->next; metal_snapshot_return(snapshot->texture); free(snapshot); }
+        metal_render_state_return(encoder->state); encoder->state=NULL;
+    }
+}
+static Method metal_render_method(Word object,const char *selector,const char *receiver,int class_receiver) {
+    if (!receiver || class_receiver) return NULL;
+    if (!strcmp(receiver,"_OBJC_CLASS_$_I2AMetalCommandBuffer") && !strcmp(selector,"renderCommandEncoderWithDescriptor:")) return (Method)metal_render_encoder;
+    if (strcmp(receiver,"_OBJC_CLASS_$_I2AMetalRenderCommandEncoder")) return NULL;
+    if (!strcmp(selector,"device")) return (Method)metal_resource_device;
+    if (!strcmp(selector,"label")) return (Method)metal_resource_label;
+    if (!strcmp(selector,"setLabel:")) return (Method)metal_resource_set_label;
+    if (!strcmp(selector,"endEncoding")) return (Method)metal_render_end;
+    if (!strcmp(selector,"setRenderPipelineState:")) return (Method)metal_render_pipeline;
+    if (!strcmp(selector,"setDepthStencilState:") || !strcmp(selector,"setCullMode:") || !strcmp(selector,"setFrontFacingWinding:") || !strcmp(selector,"setTriangleFillMode:") || !strcmp(selector,"setDepthClipMode:")) return (Method)metal_render_state;
+    if (!strcmp(selector,"setVertexBuffer:offset:atIndex:") || !strcmp(selector,"setFragmentBuffer:offset:atIndex:")) return (Method)metal_render_buffer;
+    if (!strcmp(selector,"setVertexTexture:atIndex:") || !strcmp(selector,"setFragmentTexture:atIndex:")) return (Method)metal_render_texture;
+    if (!strcmp(selector,"setVertexSamplerState:atIndex:") || !strcmp(selector,"setFragmentSamplerState:atIndex:")) return (Method)metal_render_sampler;
+    if (!strcmp(selector,"setStencilFrontReferenceValue:backReferenceValue:")) return (Method)metal_render_stencil;
+    if (!strcmp(selector,"drawPrimitives:vertexStart:vertexCount:")) return (Method)metal_render_draw;
+    if (!strcmp(selector,"drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:")) return (Method)metal_render_draw_indexed;
+    if (!strcmp(selector,"drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:")) return (Method)metal_render_draw_indexed_instances;
+    if (!strcmp(selector,"pushDebugGroup:")) return (Method)metal_render_debug_push;
+    if (!strcmp(selector,"popDebugGroup")) return (Method)metal_render_debug_pop;
+    if (!strcmp(selector,"insertDebugSignpost:")) return (Method)noop;
+    return NULL;
+}
+#undef VKD

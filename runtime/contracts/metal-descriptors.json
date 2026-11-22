@@ -1,0 +1,599 @@
+{
+  "version": 1,
+  "kinds": [
+    {
+      "id": "MD_TEXTURE",
+      "name": "MTLTextureDescriptor",
+      "defaults": {
+        "textureType": 2,
+        "pixelFormat": 70,
+        "width": 1,
+        "height": 1,
+        "depth": 1,
+        "mipmapLevelCount": 1,
+        "sampleCount": 1,
+        "arrayLength": 1
+      }
+    },
+    {
+      "id": "MD_SAMPLER",
+      "name": "MTLSamplerDescriptor",
+      "defaults": {
+        "maxAnisotropy": 1,
+        "normalizedCoordinates": 1,
+        "compareFunction": 7
+      }
+    },
+    {
+      "id": "MD_DEPTH",
+      "name": "MTLDepthStencilDescriptor",
+      "defaults": {
+        "depthCompareFunction": 7
+      }
+    },
+    {
+      "id": "MD_STENCIL",
+      "name": "MTLStencilDescriptor",
+      "defaults": {
+        "stencilCompareFunction": 7,
+        "readMask": 4294967295,
+        "writeMask": 4294967295
+      }
+    },
+    {
+      "id": "MD_PIPELINE",
+      "name": "MTLRenderPipelineDescriptor",
+      "defaults": {
+        "rasterizationEnabled": 1,
+        "sampleCount": 1
+      }
+    },
+    {
+      "id": "MD_PIPELINE_COLOR",
+      "name": "MTLRenderPipelineColorAttachmentDescriptor",
+      "defaults": {
+        "writeMask": 15,
+        "sourceRGBBlendFactor": 1,
+        "sourceAlphaBlendFactor": 1
+      }
+    },
+    {
+      "id": "MD_PASS",
+      "name": "MTLRenderPassDescriptor",
+      "defaults": {}
+    },
+    {
+      "id": "MD_PASS_COLOR",
+      "name": "MTLRenderPassColorAttachmentDescriptor",
+      "defaults": {}
+    },
+    {
+      "id": "MD_PASS_DEPTH",
+      "name": "MTLRenderPassDepthAttachmentDescriptor",
+      "defaults": {}
+    },
+    {
+      "id": "MD_PASS_STENCIL",
+      "name": "MTLRenderPassStencilAttachmentDescriptor",
+      "defaults": {}
+    },
+    {
+      "id": "MD_VERTEX",
+      "name": "MTLVertexDescriptor",
+      "defaults": {}
+    },
+    {
+      "id": "MD_ATTRIBUTE",
+      "name": "MTLVertexAttributeDescriptor",
+      "defaults": {}
+    },
+    {
+      "id": "MD_LAYOUT",
+      "name": "MTLVertexBufferLayoutDescriptor",
+      "defaults": {
+        "stepRate": 1,
+        "stepFunction": 1
+      }
+    },
+    {
+      "id": "MD_COMPILE",
+      "name": "MTLCompileOptions",
+      "defaults": {
+        "fastMathEnabled": 1
+      }
+    }
+  ],
+  "properties": [
+    {
+      "name": "label",
+      "kinds": [
+        "MD_TEXTURE",
+        "MD_SAMPLER",
+        "MD_DEPTH",
+        "MD_STENCIL",
+        "MD_PIPELINE",
+        "MD_PIPELINE_COLOR",
+        "MD_PASS",
+        "MD_PASS_COLOR",
+        "MD_PASS_DEPTH",
+        "MD_PASS_STENCIL",
+        "MD_VERTEX",
+        "MD_ATTRIBUTE",
+        "MD_LAYOUT",
+        "MD_COMPILE"
+      ],
+      "reference": true
+    },
+    {
+      "name": "pixelFormat",
+      "kinds": [
+        "MD_TEXTURE",
+        "MD_PIPELINE_COLOR"
+      ],
+      "reference": false
+    },
+    {
+      "name": "textureType",
+      "kinds": [
+        "MD_TEXTURE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "width",
+      "kinds": [
+        "MD_TEXTURE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "height",
+      "kinds": [
+        "MD_TEXTURE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "depth",
+      "kinds": [
+        "MD_TEXTURE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "mipmapLevelCount",
+      "kinds": [
+        "MD_TEXTURE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "sampleCount",
+      "kinds": [
+        "MD_TEXTURE",
+        "MD_PIPELINE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "arrayLength",
+      "kinds": [
+        "MD_TEXTURE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "resourceOptions",
+      "kinds": [
+        "MD_TEXTURE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "cpuCacheMode",
+      "kinds": [
+        "MD_TEXTURE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "storageMode",
+      "kinds": [
+        "MD_TEXTURE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "usage",
+      "kinds": [
+        "MD_TEXTURE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "minFilter",
+      "kinds": [
+        "MD_SAMPLER"
+      ],
+      "reference": false
+    },
+    {
+      "name": "magFilter",
+      "kinds": [
+        "MD_SAMPLER"
+      ],
+      "reference": false
+    },
+    {
+      "name": "mipFilter",
+      "kinds": [
+        "MD_SAMPLER"
+      ],
+      "reference": false
+    },
+    {
+      "name": "sAddressMode",
+      "kinds": [
+        "MD_SAMPLER"
+      ],
+      "reference": false
+    },
+    {
+      "name": "tAddressMode",
+      "kinds": [
+        "MD_SAMPLER"
+      ],
+      "reference": false
+    },
+    {
+      "name": "rAddressMode",
+      "kinds": [
+        "MD_SAMPLER"
+      ],
+      "reference": false
+    },
+    {
+      "name": "maxAnisotropy",
+      "kinds": [
+        "MD_SAMPLER"
+      ],
+      "reference": false
+    },
+    {
+      "name": "normalizedCoordinates",
+      "kinds": [
+        "MD_SAMPLER"
+      ],
+      "reference": false
+    },
+    {
+      "name": "compareFunction",
+      "kinds": [
+        "MD_SAMPLER"
+      ],
+      "reference": false
+    },
+    {
+      "name": "depthCompareFunction",
+      "kinds": [
+        "MD_DEPTH"
+      ],
+      "reference": false
+    },
+    {
+      "name": "depthWriteEnabled",
+      "kinds": [
+        "MD_DEPTH"
+      ],
+      "reference": false
+    },
+    {
+      "name": "stencilCompareFunction",
+      "kinds": [
+        "MD_STENCIL"
+      ],
+      "reference": false
+    },
+    {
+      "name": "stencilFailureOperation",
+      "kinds": [
+        "MD_STENCIL"
+      ],
+      "reference": false
+    },
+    {
+      "name": "depthFailureOperation",
+      "kinds": [
+        "MD_STENCIL"
+      ],
+      "reference": false
+    },
+    {
+      "name": "depthStencilPassOperation",
+      "kinds": [
+        "MD_STENCIL"
+      ],
+      "reference": false
+    },
+    {
+      "name": "readMask",
+      "kinds": [
+        "MD_STENCIL"
+      ],
+      "reference": false
+    },
+    {
+      "name": "writeMask",
+      "kinds": [
+        "MD_STENCIL",
+        "MD_PIPELINE_COLOR"
+      ],
+      "reference": false
+    },
+    {
+      "name": "vertexFunction",
+      "kinds": [
+        "MD_PIPELINE"
+      ],
+      "reference": true
+    },
+    {
+      "name": "fragmentFunction",
+      "kinds": [
+        "MD_PIPELINE"
+      ],
+      "reference": true
+    },
+    {
+      "name": "vertexDescriptor",
+      "kinds": [
+        "MD_PIPELINE"
+      ],
+      "reference": true
+    },
+    {
+      "name": "depthAttachmentPixelFormat",
+      "kinds": [
+        "MD_PIPELINE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "stencilAttachmentPixelFormat",
+      "kinds": [
+        "MD_PIPELINE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "rasterizationEnabled",
+      "kinds": [
+        "MD_PIPELINE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "alphaToCoverageEnabled",
+      "kinds": [
+        "MD_PIPELINE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "alphaToOneEnabled",
+      "kinds": [
+        "MD_PIPELINE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "blendingEnabled",
+      "kinds": [
+        "MD_PIPELINE_COLOR"
+      ],
+      "reference": false
+    },
+    {
+      "name": "sourceRGBBlendFactor",
+      "kinds": [
+        "MD_PIPELINE_COLOR"
+      ],
+      "reference": false
+    },
+    {
+      "name": "destinationRGBBlendFactor",
+      "kinds": [
+        "MD_PIPELINE_COLOR"
+      ],
+      "reference": false
+    },
+    {
+      "name": "rgbBlendOperation",
+      "kinds": [
+        "MD_PIPELINE_COLOR"
+      ],
+      "reference": false
+    },
+    {
+      "name": "sourceAlphaBlendFactor",
+      "kinds": [
+        "MD_PIPELINE_COLOR"
+      ],
+      "reference": false
+    },
+    {
+      "name": "destinationAlphaBlendFactor",
+      "kinds": [
+        "MD_PIPELINE_COLOR"
+      ],
+      "reference": false
+    },
+    {
+      "name": "alphaBlendOperation",
+      "kinds": [
+        "MD_PIPELINE_COLOR"
+      ],
+      "reference": false
+    },
+    {
+      "name": "texture",
+      "kinds": [
+        "MD_PASS_COLOR",
+        "MD_PASS_DEPTH",
+        "MD_PASS_STENCIL"
+      ],
+      "reference": true
+    },
+    {
+      "name": "resolveTexture",
+      "kinds": [
+        "MD_PASS_COLOR",
+        "MD_PASS_DEPTH",
+        "MD_PASS_STENCIL"
+      ],
+      "reference": true
+    },
+    {
+      "name": "level",
+      "kinds": [
+        "MD_PASS_COLOR",
+        "MD_PASS_DEPTH",
+        "MD_PASS_STENCIL"
+      ],
+      "reference": false
+    },
+    {
+      "name": "slice",
+      "kinds": [
+        "MD_PASS_COLOR",
+        "MD_PASS_DEPTH",
+        "MD_PASS_STENCIL"
+      ],
+      "reference": false
+    },
+    {
+      "name": "depthPlane",
+      "kinds": [
+        "MD_PASS_COLOR",
+        "MD_PASS_DEPTH",
+        "MD_PASS_STENCIL"
+      ],
+      "reference": false
+    },
+    {
+      "name": "resolveLevel",
+      "kinds": [
+        "MD_PASS_COLOR",
+        "MD_PASS_DEPTH",
+        "MD_PASS_STENCIL"
+      ],
+      "reference": false
+    },
+    {
+      "name": "resolveSlice",
+      "kinds": [
+        "MD_PASS_COLOR",
+        "MD_PASS_DEPTH",
+        "MD_PASS_STENCIL"
+      ],
+      "reference": false
+    },
+    {
+      "name": "resolveDepthPlane",
+      "kinds": [
+        "MD_PASS_COLOR",
+        "MD_PASS_DEPTH",
+        "MD_PASS_STENCIL"
+      ],
+      "reference": false
+    },
+    {
+      "name": "loadAction",
+      "kinds": [
+        "MD_PASS_COLOR",
+        "MD_PASS_DEPTH",
+        "MD_PASS_STENCIL"
+      ],
+      "reference": false
+    },
+    {
+      "name": "storeAction",
+      "kinds": [
+        "MD_PASS_COLOR",
+        "MD_PASS_DEPTH",
+        "MD_PASS_STENCIL"
+      ],
+      "reference": false
+    },
+    {
+      "name": "clearStencil",
+      "kinds": [
+        "MD_PASS_STENCIL"
+      ],
+      "reference": false
+    },
+    {
+      "name": "format",
+      "kinds": [
+        "MD_ATTRIBUTE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "offset",
+      "kinds": [
+        "MD_ATTRIBUTE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "bufferIndex",
+      "kinds": [
+        "MD_ATTRIBUTE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "stride",
+      "kinds": [
+        "MD_LAYOUT"
+      ],
+      "reference": false
+    },
+    {
+      "name": "stepFunction",
+      "kinds": [
+        "MD_LAYOUT"
+      ],
+      "reference": false
+    },
+    {
+      "name": "stepRate",
+      "kinds": [
+        "MD_LAYOUT"
+      ],
+      "reference": false
+    },
+    {
+      "name": "fastMathEnabled",
+      "kinds": [
+        "MD_COMPILE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "languageVersion",
+      "kinds": [
+        "MD_COMPILE"
+      ],
+      "reference": false
+    },
+    {
+      "name": "preprocessorMacros",
+      "kinds": [
+        "MD_COMPILE"
+      ],
+      "reference": true
+    }
+  ]
+}

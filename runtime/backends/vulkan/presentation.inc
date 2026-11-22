@@ -1,0 +1,239 @@
+ 
+#define VKD(name) ({ static PFN_##name cached; PFN_##name fn=__atomic_load_n(&cached,__ATOMIC_ACQUIRE); if (!fn) { fn=(PFN_##name)vulkan.get_device_proc(vulkan.device,#name); __atomic_store_n(&cached,fn,__ATOMIC_RELEASE); } fn; })
+struct MetalDrawable { Word isa; struct MetalTexture *texture; uint32_t index; unsigned presented; Word identifier; VkResult result; struct MetalLifetime lifetime; };
+static void metal_drawable_destroy(Word value) {
+    struct MetalDrawable *drawable=(void *)value;
+    metal_object_release((Word)drawable->texture); free(drawable);
+}
+static struct {
+    pthread_mutex_t mutex;
+    VkSwapchainKHR swapchain;
+    VkFence acquire_fence;
+    VkFormat format;
+    VkExtent2D extent;
+    uint32_t count;
+    VkImage images[8];
+    VkSemaphore finished[8];
+    unsigned presented[8];
+    struct MetalTexture *backings[8];
+    Word next_identifier;
+    unsigned outstanding,dirty;
+} metal_presentation={.mutex=PTHREAD_MUTEX_INITIALIZER};
+ 
+static VkResult metal_surface_refresh(void) {
+    pthread_mutex_lock(&graphics.mutex);
+    ANativeWindow *window=graphics.window; unsigned generation=graphics.window_generation;
+    if (window) ANativeWindow_acquire(window);
+    pthread_mutex_unlock(&graphics.mutex);
+    if (!window) return VK_NOT_READY;
+    if (generation==vulkan.window_generation && !__atomic_load_n(&metal_presentation.dirty,__ATOMIC_ACQUIRE)) { ANativeWindow_release(window); return VK_SUCCESS; }
+    if (metal_presentation.outstanding) { ANativeWindow_release(window); return VK_NOT_READY; }
+    pthread_mutex_lock(&vulkan_mutex);
+    VkResult result=VKD(vkQueueWaitIdle)(vulkan.queue);
+    if (result==VK_SUCCESS) {
+        if (metal_presentation.swapchain) VKD(vkDestroySwapchainKHR)(vulkan.device,metal_presentation.swapchain,NULL);
+        if (metal_presentation.acquire_fence) VKD(vkDestroyFence)(vulkan.device,metal_presentation.acquire_fence,NULL);
+        for (unsigned i=0;i<8;++i) {
+            if (metal_presentation.finished[i]) VKD(vkDestroySemaphore)(vulkan.device,metal_presentation.finished[i],NULL);
+            metal_presentation.finished[i]=VK_NULL_HANDLE; metal_presentation.presented[i]=0; metal_presentation.images[i]=VK_NULL_HANDLE;
+        }
+        metal_presentation.swapchain=VK_NULL_HANDLE; metal_presentation.acquire_fence=VK_NULL_HANDLE; metal_presentation.count=0;
+        PFN_vkDestroySurfaceKHR destroy=(PFN_vkDestroySurfaceKHR)vulkan.get_instance_proc(vulkan.instance,"vkDestroySurfaceKHR");
+        if (vulkan.surface) destroy(vulkan.instance,vulkan.surface,NULL);
+        vulkan.surface=VK_NULL_HANDLE;
+        if (vulkan.window) ANativeWindow_release(vulkan.window);
+        vulkan.window=window; window=NULL;
+        PFN_vkCreateAndroidSurfaceKHR create=(PFN_vkCreateAndroidSurfaceKHR)vulkan.get_instance_proc(vulkan.instance,"vkCreateAndroidSurfaceKHR");
+        VkAndroidSurfaceCreateInfoKHR info={.sType=VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,.window=vulkan.window};
+        result=create(vulkan.instance,&info,NULL,&vulkan.surface);
+        if (result==VK_SUCCESS) { vulkan.window_generation=generation; __atomic_store_n(&metal_presentation.dirty,0,__ATOMIC_RELEASE); }
+        LOG("Vulkan Surface refreshed: generation=%u result=%d",generation,result);
+    }
+    pthread_mutex_unlock(&vulkan_mutex);
+    if (window) ANativeWindow_release(window);
+    return result;
+}
+static VkResult metal_swapchain_create(void) {
+    VkSurfaceCapabilitiesKHR capabilities;
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR query=(PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)vulkan.get_instance_proc(vulkan.instance,"vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    PFN_vkGetPhysicalDeviceSurfaceFormatsKHR formats=(PFN_vkGetPhysicalDeviceSurfaceFormatsKHR)vulkan.get_instance_proc(vulkan.instance,"vkGetPhysicalDeviceSurfaceFormatsKHR");
+    VkResult result=query(vulkan.physical,vulkan.surface,&capabilities); if (result!=VK_SUCCESS) return result;
+    if (!(capabilities.supportedUsageFlags&VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    uint32_t count=0; result=formats(vulkan.physical,vulkan.surface,&count,NULL);
+    if (result!=VK_SUCCESS || !count || count>256) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    VkSurfaceFormatKHR available[256]; result=formats(vulkan.physical,vulkan.surface,&count,available); if (result!=VK_SUCCESS) return result;
+    VkSurfaceFormatKHR selected={VK_FORMAT_UNDEFINED,VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
+    for (unsigned i=0;i<count;++i) if (available[i].colorSpace==VK_COLOR_SPACE_SRGB_NONLINEAR_KHR &&
+        (available[i].format==VK_FORMAT_B8G8R8A8_SRGB || available[i].format==VK_FORMAT_R8G8B8A8_SRGB)) { selected=available[i]; break; }
+    if (selected.format==VK_FORMAT_UNDEFINED) { LOG("No sRGB swapchain format available for native XR conversion"); return VK_ERROR_FORMAT_NOT_SUPPORTED; }
+    VkFormatProperties properties;
+    PFN_vkGetPhysicalDeviceFormatProperties format_query=(PFN_vkGetPhysicalDeviceFormatProperties)vulkan.get_instance_proc(vulkan.instance,"vkGetPhysicalDeviceFormatProperties");
+    format_query(vulkan.physical,selected.format,&properties);
+    if (!(properties.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_DST_BIT)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    VkExtent2D extent=capabilities.currentExtent;
+    if (extent.width==UINT32_MAX) {
+        extent=(VkExtent2D){(uint32_t)graphics.width,(uint32_t)graphics.height};
+        if (extent.width<capabilities.minImageExtent.width) extent.width=capabilities.minImageExtent.width;
+        if (extent.width>capabilities.maxImageExtent.width) extent.width=capabilities.maxImageExtent.width;
+        if (extent.height<capabilities.minImageExtent.height) extent.height=capabilities.minImageExtent.height;
+        if (extent.height>capabilities.maxImageExtent.height) extent.height=capabilities.maxImageExtent.height;
+    }
+    uint32_t image_count=capabilities.minImageCount+1;
+    if (capabilities.maxImageCount && image_count>capabilities.maxImageCount) image_count=capabilities.maxImageCount;
+    if (image_count>8) return VK_ERROR_FEATURE_NOT_PRESENT;
+    VkCompositeAlphaFlagBitsKHR alpha=VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    if (!(capabilities.supportedCompositeAlpha&alpha)) alpha=(VkCompositeAlphaFlagBitsKHR)(capabilities.supportedCompositeAlpha&(~capabilities.supportedCompositeAlpha+1));
+     
+    VkSurfaceTransformFlagBitsKHR transform=VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    if (!(capabilities.supportedTransforms&transform)) return VK_ERROR_FEATURE_NOT_PRESENT;
+    VkSwapchainCreateInfoKHR info={.sType=VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,.surface=vulkan.surface,.minImageCount=image_count,
+        .imageFormat=selected.format,.imageColorSpace=selected.colorSpace,.imageExtent=extent,.imageArrayLayers=1,.imageUsage=VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .imageSharingMode=VK_SHARING_MODE_EXCLUSIVE,.preTransform=transform,.compositeAlpha=alpha,.presentMode=VK_PRESENT_MODE_FIFO_KHR,.clipped=VK_TRUE};
+    result=VKD(vkCreateSwapchainKHR)(vulkan.device,&info,NULL,&metal_presentation.swapchain); if (result!=VK_SUCCESS) return result;
+    count=8; result=VKD(vkGetSwapchainImagesKHR)(vulkan.device,metal_presentation.swapchain,&count,metal_presentation.images);
+    if (result!=VK_SUCCESS || !count || count>8) return VK_ERROR_INITIALIZATION_FAILED;
+    metal_presentation.count=count; metal_presentation.extent=extent; metal_presentation.format=selected.format;
+    VkFenceCreateInfo fence={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    result=VKD(vkCreateFence)(vulkan.device,&fence,NULL,&metal_presentation.acquire_fence); if (result!=VK_SUCCESS) return result;
+    VkSemaphoreCreateInfo semaphore={.sType=VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    for (unsigned i=0;i<count;++i) { result=VKD(vkCreateSemaphore)(vulkan.device,&semaphore,NULL,&metal_presentation.finished[i]); if (result!=VK_SUCCESS) return result; }
+    LOG("Vulkan Android swapchain ready: %ux%u format=%u images=%u surfaceTransform=0x%x preTransform=0x%x supported=0x%x",extent.width,extent.height,selected.format,count,capabilities.currentTransform,transform,capabilities.supportedTransforms);
+    return VK_SUCCESS;
+}
+static Word metal_next_drawable(Word object,const char *selector) {
+    if (!vulkan.available) return 0;
+    struct MetalLayer *layer=metal_layer(object);
+    if (!layer->device || layer->size.width<1 || layer->size.height<1 || layer->size.width>UINT32_MAX || layer->size.height>UINT32_MAX) return 0;
+    pthread_mutex_lock(&metal_presentation.mutex);
+    VkResult result=metal_surface_refresh();
+    if (result==VK_SUCCESS && !metal_presentation.swapchain) result=metal_swapchain_create();
+    uint32_t index=0;
+    uint64_t diagnostic_acquire=render_diagnostic_clock();
+    if (result==VK_SUCCESS) result=VKD(vkResetFences)(vulkan.device,1,&metal_presentation.acquire_fence);
+    if (result==VK_SUCCESS) result=VKD(vkAcquireNextImageKHR)(vulkan.device,metal_presentation.swapchain,1000000000ULL,VK_NULL_HANDLE,metal_presentation.acquire_fence,&index);
+    if (result==VK_SUBOPTIMAL_KHR) result=VK_SUCCESS;
+    /* The acquisition fence establishes ownership before recording. Reacquiring
+     * the same image also guarantees its prior present semaphore was consumed. */
+    if (result==VK_SUCCESS) result=VKD(vkWaitForFences)(vulkan.device,1,&metal_presentation.acquire_fence,VK_TRUE,UINT64_MAX);
+    render_diagnostic_cost(6,diagnostic_acquire);
+    if (result!=VK_SUCCESS) {
+        if (result==VK_ERROR_OUT_OF_DATE_KHR || result==VK_ERROR_SURFACE_LOST_KHR) __atomic_store_n(&metal_presentation.dirty,1,__ATOMIC_RELEASE);
+        pthread_mutex_unlock(&metal_presentation.mutex);
+        if (result!=VK_NOT_READY && result!=VK_TIMEOUT) LOG("Vulkan drawable acquisition failed: %d",result);
+        return 0;
+    }
+    struct MetalTexture *backing=metal_presentation.backings[index];
+    if (backing && (backing->width!=(Word)layer->size.width || backing->height!=(Word)layer->size.height || backing->format.metal!=layer->pixel_format)) {
+        /* Drop only the presentation cache's owner. A retained drawable/texture
+         * wrapper and recorded GPU commands keep their own references. */
+        metal_presentation.backings[index]=NULL; metal_object_release((Word)backing); backing=NULL;
+    }
+    if (!backing) {
+        struct MetalDescriptor *description=(void *)metal_descriptor_create(MD_TEXTURE);
+        metal_property_assign(description,"pixelFormat",layer->pixel_format);
+        metal_property_assign(description,"width",(Word)layer->size.width); metal_property_assign(description,"height",(Word)layer->size.height);
+        metal_property_assign(description,"resourceOptions",0x20); metal_property_assign(description,"usage",5);
+        backing=(void *)metal_texture_new(layer->device,"Vulkan drawable backing",description); metal_object_release((Word)description);
+        if (backing) {
+            VkFormatProperties properties;
+            PFN_vkGetPhysicalDeviceFormatProperties query=(PFN_vkGetPhysicalDeviceFormatProperties)vulkan.get_instance_proc(vulkan.instance,"vkGetPhysicalDeviceFormatProperties");
+            query(vulkan.physical,backing->format.format,&properties);
+            if (!(properties.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_SRC_BIT)) { metal_object_release((Word)backing); pthread_mutex_unlock(&metal_presentation.mutex); return 0; }
+        }
+        metal_presentation.backings[index]=backing;
+    }
+    if (!backing) { pthread_mutex_unlock(&metal_presentation.mutex); return 0; }
+    struct MetalDrawable *drawable=calloc(1,sizeof(*drawable));
+    if (drawable) {
+        *drawable=(struct MetalDrawable){.isa=external_class("_OBJC_CLASS_$_I2AMetalDrawable"),.texture=(void *)metal_object_retain((Word)backing),.index=index,.identifier=++metal_presentation.next_identifier};
+        metal_lifetime_init((Word)drawable,__builtin_offsetof(struct MetalDrawable,lifetime),metal_drawable_destroy);
+        ++metal_presentation.outstanding;
+    }
+    pthread_mutex_unlock(&metal_presentation.mutex); return metal_object_autorelease((Word)drawable);
+}
+static Word metal_drawable_texture(struct MetalDrawable *drawable) { return (Word)drawable->texture; }
+static Word metal_drawable_id(struct MetalDrawable *drawable) { return drawable->identifier; }
+static void metal_command_present(struct MetalCommand *command,const char *selector,struct MetalDrawable *drawable) {
+    if (!drawable || drawable->isa!=external_class("_OBJC_CLASS_$_I2AMetalDrawable") || drawable->presented || command->drawable || command->active_encoder || metal_command_status(&command->object)>=2)
+        stop("Invalid drawable or presentation command state",selector);
+    struct MetalTexture *texture=drawable->texture;
+    struct MetalCommandTexture *use=metal_command_texture(command,texture);
+    use->layout_used=1;
+    pthread_mutex_lock(&command->pool_owner->mutex);
+    VkImageMemoryBarrier barrier={.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT|VK_ACCESS_MEMORY_READ_BIT,
+        .dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT,.oldLayout=use->layout,.newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.image=texture->image,
+        .subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
+    VKD(vkCmdPipelineBarrier)(command->command,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,NULL,0,NULL,1,&barrier);
+    barrier.srcAccessMask=0; barrier.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; barrier.image=metal_presentation.images[drawable->index];
+    barrier.oldLayout=__atomic_load_n(&metal_presentation.presented[drawable->index],__ATOMIC_ACQUIRE) ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    VKD(vkCmdPipelineBarrier)(command->command,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,NULL,0,NULL,1,&barrier);
+    VkImageBlit blit={.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.srcOffsets={{0,0,0},{(int32_t)texture->width,(int32_t)texture->height,1}},
+        .dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.dstOffsets={{0,0,0},{(int32_t)metal_presentation.extent.width,(int32_t)metal_presentation.extent.height,1}}};
+    VKD(vkCmdBlitImage)(command->command,texture->image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,barrier.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&blit,VK_FILTER_NEAREST);
+    barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; barrier.dstAccessMask=0; barrier.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; barrier.newLayout=VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    VKD(vkCmdPipelineBarrier)(command->command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,0,NULL,0,NULL,1,&barrier);
+    pthread_mutex_unlock(&command->pool_owner->mutex);
+    use->layout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    command->drawable=(void *)metal_object_retain((Word)drawable); ++command->recorded_operations;
+}
+static VkSemaphore metal_drawable_signal(struct MetalCommand *command) { return command->drawable ? metal_presentation.finished[command->drawable->index] : VK_NULL_HANDLE; }
+static VkResult metal_drawable_present(struct MetalCommand *command) {
+    struct MetalDrawable *drawable=command->drawable; if (!drawable) return VK_SUCCESS;
+    VkSemaphore signal=metal_drawable_signal(command);
+    VkPresentInfoKHR info={.sType=VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,.waitSemaphoreCount=1,.pWaitSemaphores=&signal,
+        .swapchainCount=1,.pSwapchains=&metal_presentation.swapchain,.pImageIndices=&drawable->index};
+    uint64_t diagnostic_present=render_diagnostic_clock();
+    VkResult result=VKD(vkQueuePresentKHR)(vulkan.queue,&info);
+     
+    if (result==VK_ERROR_OUT_OF_DATE_KHR || result==VK_ERROR_SURFACE_LOST_KHR) __atomic_store_n(&metal_presentation.dirty,1,__ATOMIC_RELEASE);
+    render_diagnostic_cost(5,diagnostic_present);
+    if (result==VK_SUCCESS || result==VK_SUBOPTIMAL_KHR) metal_diagnostic_present();
+    drawable->result=result;
+    drawable->presented=1; __atomic_store_n(&metal_presentation.presented[drawable->index],1,__ATOMIC_RELEASE);
+#if I2A_DEVELOPMENT
+    static unsigned logged;
+    if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<16) LOG("Vulkan drawable queued for presentation: id=%lu result=%d",drawable->identifier,result);
+    static uint64_t interval_start; static unsigned frames;
+    struct timespec time; clock_gettime(CLOCK_MONOTONIC,&time);
+    uint64_t now=(uint64_t)time.tv_sec*1000000000ULL+(uint64_t)time.tv_nsec;
+    if (!interval_start) interval_start=now;
+    ++frames;
+    if (now-interval_start>=2000000000ULL) {
+        LOG("Vulkan presentation rate: %.2f fps (%u frames in %.3fs)",frames*1e9/(double)(now-interval_start),frames,(now-interval_start)*1e-9);
+        frames=0; interval_start=now;
+    }
+#endif
+    return result;
+}
+static void metal_first_frame_deliver(void *unused) {
+    JNIEnv *env=attached_environment("Guest application first frame"); jclass cls=(*env)->GetObjectClass(env,activity);
+    jmethodID method=(*env)->GetMethodID(env,cls,"firstFrameRendered","()V");
+    (*env)->CallVoidMethod(env,activity,method); (*env)->DeleteLocalRef(env,cls);
+    LOG("Guest application first frame reached its Vulkan fence and presentation queue");
+}
+static void metal_first_frame_complete(struct MetalCommand *command) {
+    static unsigned delivered;
+    if (command->drawable && command->drawable->presented && (command->drawable->result==VK_SUCCESS || command->drawable->result==VK_SUBOPTIMAL_KHR) &&
+        !__atomic_exchange_n(&delivered,1,__ATOMIC_ACQ_REL)) schedule_main_function(metal_first_frame_deliver,NULL);
+}
+static void metal_drawable_complete(struct MetalCommand *command) {
+    if (!command->drawable) return;
+    pthread_mutex_lock(&metal_presentation.mutex);
+    if (metal_presentation.outstanding) --metal_presentation.outstanding;
+    pthread_mutex_unlock(&metal_presentation.mutex);
+    struct MetalDrawable *drawable=command->drawable; command->drawable=NULL;
+    metal_object_release((Word)drawable);
+}
+static Method metal_present_method(Word object,const char *selector,const char *receiver,int class_receiver) {
+    if (!receiver || class_receiver) return NULL;
+    if (!strcmp(receiver,"_OBJC_CLASS_$_CAMetalLayer") && !strcmp(selector,"nextDrawable")) return (Method)metal_next_drawable;
+    if (!strcmp(receiver,"_OBJC_CLASS_$_I2AMetalCommandBuffer") && !strcmp(selector,"presentDrawable:")) return (Method)metal_command_present;
+    if (!strcmp(receiver,"_OBJC_CLASS_$_I2AMetalDrawable")) {
+        if (!strcmp(selector,"texture")) return (Method)metal_drawable_texture;
+        if (!strcmp(selector,"drawableID")) return (Method)metal_drawable_id;
+    }
+    return NULL;
+}
+#undef VKD
