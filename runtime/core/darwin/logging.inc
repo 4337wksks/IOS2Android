@@ -15,7 +15,7 @@ static int guest_setlogmask(int mask) {
     pthread_mutex_unlock(&syslog_mutex); return previous;
 }
 __attribute__((used,noinline)) static void guest_syslog(int priority,const char *format,const unsigned char *arguments) {
-    if (!I2A_DEVELOPMENT && (priority&7)>3) return;
+    if (!I2A_DEVELOPMENT) return;
     int saved=errno,level=priority&7,options;
     char ident[128];
     pthread_mutex_lock(&syslog_mutex);

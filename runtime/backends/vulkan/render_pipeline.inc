@@ -63,7 +63,13 @@ JNIEXPORT void JNICALL HOST_JNI(HostActivity_persistPipelineCache)(JNIEnv *env,j
     uint64_t generation=metal_pipeline_generation;size_t size=0;void *data=NULL;VkResult result=VK_SUCCESS;
     if(shader_cache_directory && metal_pipeline_cache && generation!=metal_pipeline_saved_generation){result=VKD(vkGetPipelineCacheData)(vulkan.device,metal_pipeline_cache,&size,NULL);if(result==VK_SUCCESS && size){data=malloc(size);if(data)result=VKD(vkGetPipelineCacheData)(vulkan.device,metal_pipeline_cache,&size,data);else result=VK_ERROR_OUT_OF_HOST_MEMORY;}}
     pthread_mutex_unlock(&metal_pipeline_cache_mutex);int saved=0;
-    if(data && result==VK_SUCCESS){char *path=NULL,*temporary=NULL;if(asprintf(&path,"%s/pipelines.bin",shader_cache_directory)>=0 && asprintf(&temporary,"%s/pipelines-XXXXXX.tmp",shader_cache_directory)>=0){int fd=mkstemps(temporary,4);if(fd>=0){size_t done=0;while(done<size){ssize_t written=write(fd,(char *)data+done,size-done);if(written<0 && errno==EINTR)continue;if(written<=0)break;done+=(size_t)written;}int closed=close(fd);if(done==size && !closed && !rename(temporary,path))saved=1;else LOG("Vulkan pipeline cache write failed: %s",strerror(errno));unlink(temporary);}}free(path);free(temporary);}
+    if(data && result==VK_SUCCESS){char *path=NULL;if(asprintf(&path,"%s/pipelines.bin",shader_cache_directory)>=0){
+#ifdef I2A_CACHE_STORE
+        saved=I2A_CACHE_STORE(path,data,size);
+#else
+        char *temporary=NULL;if(asprintf(&temporary,"%s/pipelines-XXXXXX.tmp",shader_cache_directory)>=0){int fd=mkstemps(temporary,4);if(fd>=0){size_t done=0;while(done<size){ssize_t written=write(fd,(char *)data+done,size-done);if(written<0 && errno==EINTR)continue;if(written<=0)break;done+=(size_t)written;}int closed=close(fd);if(done==size && !closed && !rename(temporary,path))saved=1;else LOG("Vulkan pipeline cache write failed: %s",strerror(errno));unlink(temporary);}free(temporary);}
+#endif
+    }free(path);}
     else if(result!=VK_SUCCESS)LOG("Vulkan pipeline cache serialization failed: result=%d",result);
     free(data);pthread_mutex_lock(&metal_pipeline_cache_mutex);if(saved){metal_pipeline_saved_generation=generation;LOG("Vulkan pipeline cache saved: %zu bytes",size);}int changed=saved && generation!=metal_pipeline_generation;__atomic_store_n(&metal_pipeline_save_pending,0,__ATOMIC_RELEASE);pthread_mutex_unlock(&metal_pipeline_cache_mutex);pthread_mutex_unlock(&metal_pipeline_save_mutex);
     if(changed)metal_pipeline_request_save();

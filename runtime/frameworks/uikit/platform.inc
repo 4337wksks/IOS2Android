@@ -331,14 +331,14 @@ static Method web_method(Word object,const char *selector,const char *receiver,i
 static Method ui_platform_method(Word object,const char *selector,const char *receiver,int class_receiver) {
     if (!receiver) return NULL;
     Method web=web_method(object,selector,receiver,class_receiver);if(web)return web;
-    if (object==(Word)&application) {
+    if (object==application_object) {
         if (!strcmp(selector,"setIdleTimerDisabled:")) return (Method)ui_idle_timer;
         if (!strcmp(selector,"isIdleTimerDisabled") || !strcmp(selector,"idleTimerDisabled")) return (Method)ui_idle_state;
         if (!strcmp(selector,"openURL:")) return (Method)ui_open_url;
         if (!strcmp(selector,"canOpenURL:")) return (Method)ui_can_open_url;
         if (!strcmp(selector,"openURL:options:completionHandler:")) return (Method)ui_open_url_options;
     }
-    if (!class_receiver && (!strcmp(receiver,"_OBJC_CLASS_$_UIView") || !strcmp(receiver,"_OBJC_CLASS_$_UILabel") || object==(Word)&root_view) && !strcmp(selector,"safeAreaInsets")) return (Method)ui_safe_insets;
+    if (!class_receiver && class_inherits(read_word(object),external_class("_OBJC_CLASS_$_UIView")) && !strcmp(selector,"safeAreaInsets")) return (Method)ui_safe_insets;
     if (!strcmp(receiver,"_OBJC_CLASS_$_UIPasteboard")) {
         if (class_receiver && !strcmp(selector,"generalPasteboard")) return (Method)ui_pasteboard;
         if (class_receiver && !strcmp(selector,"pasteboardWithName:create:")) return (Method)ui_pasteboard_named;

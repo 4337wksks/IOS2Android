@@ -19,7 +19,7 @@ static void run_interface_preflight(void) {
         struct HostObject prototype={0}; prototype.isa=cls;
         Word object=probe->class_method ? cls : (Word)&prototype;
         if (!probe->class_method) {
-            struct HostObject *singletons[]={&application,&defaults,&process_info,&bundle,&file_manager,&main_thread,&screen_object,&device,&game_center_player,&payment_queue};
+            struct HostObject *singletons[]={(void *)application_object,&defaults,&process_info,&bundle,&file_manager,&main_thread,&screen_object,&device,&game_center_player,&payment_queue};
             for (unsigned j=0;j<COUNT(singletons);++j) if (singletons[j]->isa==cls && cls) { object=(Word)singletons[j]; break; }
         }
         Method method=cls ? find_implementation(object,probe->selector) : NULL;

@@ -58,27 +58,25 @@ python -B -m porter --help
 python -B -m porter build --help
 ```
 
-The CLI provides `inspect`, `build`, `check-core`, and `shader`. The `check-core` command compiles only the core runtime, without linking application adapters, and does not produce a runnable APK.
+The CLI provides `inspect`, `build`, `check-core`, and `shader`. The `check-core` command compiles only the core runtime, without linking application adapters, and does not produce a runnable APK. Dev APKs enable Android debugging for ADB access to private storage; release APKs disable it.
 
 External adapters supply application patches, resource replacements, service configuration, and shader translation rules. Keep IPAs, toolchains, configuration, signing keys, adapters, and build outputs outside the repository.
 
 Online services reuse portable endpoints and configuration from the original application where available. iOS account, payment, push, and third-party platform identifiers cannot be used directly on Android. Without compatible configuration, the runtime reports failure or unavailability. Helpshift can use its web backend when a valid domain is available.
 
-Read-only bundle resources are accessed through Android AssetManager from the installed APK. File interfaces preserve entry-relative offsets, lengths, and EOF; uncompressed resources can be mapped directly, while compressed entries are decoded into memory on demand. Only interfaces requiring a real filesystem path extract individual files. Startup removes obsolete resource caches created by the runtime.
-
-The build packs SPIR-V into `assets/i2a/shaders.bin`. First use places it in the application's private `code_cache/vulkan/<PACKAGE_REVISION>/` directory; later launches map this cached pack. Graphics and compute pipelines share persistent `pipelines.bin` data, with the driver reusing cached code for matching pipeline states. `PACKAGE_REVISION` changes on each packaging run independently of the application version. Startup removes older revision directories, and incompatible GPU or driver cache data is rebuilt. Cache write failures do not prevent normal resource access or pipeline creation.
+Resources are normally read from the installed APK; interfaces that require a real file path extract individual files. Startup removes resource copies left by older runtime versions. Shaders and driver compilation results are cached in private storage. Updates remove old caches even when the application version stays the same. Unavailable caches are regenerated.
 
 APKs are written to `out/<application-id>/<CFBundleVersion>/dev|release/` in the external workspace. Build different input versions sequentially when sharing a cache. Use separate workspaces for parallel builds.
 
 ### Compatibility
 
 - Encrypted binaries and chained fixups are not supported. Dynamic library and symbol loading also have coverage limits.
-- UIKit, Auto Layout, and CoreAnimation are partially implemented. Arbitrary NIB screens and full touch scrolling and table view behavior are not supported.
-- WebKit still lacks synchronous JavaScript, multiple windows, downloads, streaming requests, POST requests with custom headers, navigation response decisions, and nonzero data detection options.
-- Text input still lacks complete TextKit, custom text containers, composed-character deletion, calendar data detection, and native status-bar scroll-to-top behavior.
+- Scene lifecycle, complex NIBs, layout, animation, scrolling, tables, and text editing still have compatibility gaps; not every native interface can be rendered.
+- Web pages support basic loading and interaction. Multiple windows, downloads, and some navigation and scripting APIs remain unsupported.
 - Metal-to-Vulkan and MSL/AIR translation cover only the interfaces and translation paths currently implemented.
 - Audio format support is limited, and real-time AudioQueue playback is not implemented.
 - Full calendar/location notification triggers, notification actions and attachments, Bonjour browsing/resolution, and gesture failure dependencies and arbitration are not implemented.
+- Background location, region monitoring, heading, and some authorization APIs are not implemented. Geocoding depends on the device's Android service.
 
 ### License and attribution
 

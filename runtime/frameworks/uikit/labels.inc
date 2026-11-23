@@ -160,7 +160,7 @@ static void ui_label_sync(Word object) {
         LOG("[DIAG-label] font=%g scale=%g lines=%ld adjusts=%d local=%g,%g,%g,%g",font ? font->size : 17,scale,s->lines,s->adjusts,v->frame.x,v->frame.y,v->frame.width,v->frame.height);
         if (runtime_extension.label_diagnostic) runtime_extension.label_diagnostic(object);
         for (Word parent=v->parent;parent;parent=view_state(parent)->parent)
-            LOG("[DIAG-label] ancestor=%p class=%s frame=%g,%g,%g,%g root=%d",(void *)parent,class_name(read_word(parent)),view_state(parent)->frame.x,view_state(parent)->frame.y,view_state(parent)->frame.width,view_state(parent)->frame.height,parent==(Word)&root_view);
+            LOG("[DIAG-label] ancestor=%p class=%s frame=%g,%g,%g,%g root=%d",(void *)parent,class_name(read_word(parent)),view_state(parent)->frame.x,view_state(parent)->frame.y,view_state(parent)->frame.width,view_state(parent)->frame.height,root_controller && parent==controller_loaded_view(root_controller));
     }
 #endif
     JNIEnv *env=attached_environment("UILabel sync"); jclass cls=(*env)->GetObjectClass(env,activity);
@@ -449,11 +449,16 @@ static void ui_view_request_display(Word object,const char *selector) {
 static struct GuestSize image_view_size(Word object,const char *selector,struct GuestSize limit) { Word image=control_state(object)->image; struct ImageSize size=image ? ui_image_size(image) : (struct ImageSize){0}; return (struct GuestSize){size.width,size.height}; }
 static void image_view_fit(Word object,const char *selector) { struct ViewState *view=view_state(object); struct GuestSize size=image_view_size(object,selector,(struct GuestSize){0}); struct GuestRect frame=view->frame; frame.width=size.width; frame.height=size.height; view_set_frame(object,selector,frame); }
 static int ui_view_rendered(Word object) { return label_object(object) || view_state(object)->control!=NULL || view_state(object)->web!=NULL || view_state(object)->input!=NULL; }
+static void ui_view_load_label(Word object,plist_t node){
+    const char *text=plist_get_string_ptr(plist_dict_get_item(node,"text"),NULL);if(text)label_text(object,"Archived label",copy_string(text));
+    plist_t color=plist_dict_get_item(node,"textColor");if(plist_get_node_type(color)==PLIST_ARRAY){double rgba[4]={0};for(unsigned i=0;i<4;++i)plist_get_real_val(plist_array_get_item(color,i),rgba+i);label_color(object,"Archived label",ui_color_rgba(external_class("_OBJC_CLASS_$_UIColor"),"colorWithRed:green:blue:alpha:",rgba[0],rgba[1],rgba[2],rgba[3]));}
+    label_alignment(object,"Archived label",(long)scene_number(node,"alignment",0));label_lines(object,"Archived label",(long)scene_number(node,"lines",1));
+}
 static void ui_view_load_content(Word object,const char *image,const double *background) {
     if (background) view_state(object)->background=ui_color_rgba(external_class("_OBJC_CLASS_$_UIColor"),"colorWithRed:green:blue:alpha:",background[0],background[1],background[2],background[3]);
     if (image && *image) {
         Word content=ui_image_named(external_class("_OBJC_CLASS_$_UIImage"),"imageNamed:",copy_string(image));
-        if (!content) stop("Missing original storyboard image",image);
+        if (!content) LOG("Storyboard image unavailable: %s",image);
         image_view_set_image(object,"setImage:",content);
     } else ui_label_sync(object);
 }
@@ -493,7 +498,7 @@ static struct GuestSize ui_view_intrinsic_size(Word object) {
 static Method ui_labels_method(Word object,const char *selector,const char *receiver,int class_receiver) {
     if (!receiver) return NULL;
     if(!class_receiver && class_inherits(read_word(object),external_class("_OBJC_CLASS_$_UITextView")) && !strcmp(selector,"sizeThatFits:"))return (Method)text_editor_size;
-    if (!class_receiver && !strcmp(selector,"intrinsicContentSize") && (label_object(object) || view_state(object)->control)) return (Method)ui_view_intrinsic_size;
+    if (!class_receiver && !strcmp(selector,"intrinsicContentSize")){struct ViewState *state=existing_view_state(object);if(label_object(object) || (state && state->control))return (Method)ui_view_intrinsic_size;}
     Word cls=class_receiver ? object : read_word(object);
     if (!class_receiver && class_inherits(cls,external_class("_OBJC_CLASS_$_UIActivityIndicatorView"))) {
         if (!strcmp(selector,"initWithActivityIndicatorStyle:")) return (Method)indicator_init;

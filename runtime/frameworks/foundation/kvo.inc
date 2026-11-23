@@ -56,7 +56,7 @@ static void key_observers_emit(Word object,Word key,Word old,Word value,int prio
 }
 static void key_observer_add(Word object,const char *selector,Word observer,Word key,Word options,Word context) {
     const char *name=string_bytes(key,selector),*base=external_base(read_word(object));
-    int app=object==(Word)&application && !strcmp(name,"delegate");
+    int app=object==application_object && !strcmp(name,"delegate");
     int operation=base && (!strcmp(base,"_OBJC_CLASS_$_NSOperation") || !strcmp(base,"_OBJC_CLASS_$_NSBlockOperation") || !strcmp(base,"_OBJC_CLASS_$_NSInvocationOperation"));
     if (!observer || strchr(name,'.') || options>15 || (!app && !operation)) stop("Automatic KVO for this property is not implemented",name);
     struct KeyObserver *item=calloc(1,sizeof(*item)); if (!item) stop("Allocation failed",selector);

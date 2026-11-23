@@ -1,7 +1,4 @@
-/* Scene identities are recovered from the original NIBs at build time. Return
- * real archived controller classes, never an UIAlertController standing in for
- * a navigation/table controller. Arbitrary SDK view rendering remains an
- * explicit capability boundary, separate from controller/scene ownership. */
+/* Controller identities come from the original archives. */
 #include "storyboard_catalogue.h"
 struct StoryboardResource { Word isa,bundle,metadata,name,scenes,path; };
 static Word storyboard_catalogue;
@@ -47,6 +44,7 @@ static Word storyboard_create(Word cls,const char *selector,Word name,Word resou
 static void storyboard_attach_controller(struct StoryboardResource *board,Word controller,struct GuestMap *scene) {
     struct ViewState *state=view_state(controller);
     state->storyboard=(Word)board; state->nib_bundle=board->bundle;
+    state->archived_graph=map_get(scene,"Storyboard view",copy_string("viewGraph"));
     state->nib_name=map_get(scene,"Storyboard nib",copy_string("nib"));
     if (state->nib_name && !string_length(state->nib_name,"Storyboard nib")) state->nib_name=0;
     Word style=map_get(scene,"Storyboard navigation bar",copy_string("barStyle"));
@@ -64,7 +62,7 @@ static Word storyboard_instantiate(struct StoryboardResource *board,const char *
     storyboard_attach_controller(board,controller,scene);
     view_state(controller)->deferred_storyboard=1;
 #if I2A_DEVELOPMENT
-    LOG("[DIAG-storyboard] resource=%s scene=%s class=%s widget-presentation=unavailable",string_bytes(board->name,selector),string_bytes(identifier,selector),string_bytes(class_name_value,selector));
+    LOG("[DIAG-storyboard] resource=%s scene=%s class=%s view-archive=%s",string_bytes(board->name,selector),string_bytes(identifier,selector),string_bytes(class_name_value,selector),view_state(controller)->archived_graph ? "supported" : "unavailable");
 #endif
     return controller;
 }
@@ -72,20 +70,12 @@ static Word storyboard_initial(struct StoryboardResource *board,const char *sele
     Word identifier=map_get((void *)board->metadata,selector,copy_string("UIStoryboardDesignatedEntryPointIdentifier"));
     return identifier ? storyboard_instantiate(board,selector,identifier) : 0;
 }
+static Word storyboard_startup(Word name){struct StoryboardResource *board=(void *)storyboard_create(external_class("_OBJC_CLASS_$_UIStoryboard"),"Main storyboard",name,(Word)&bundle);return storyboard_initial(board,"instantiateInitialViewController");}
 static Word controller_storyboard(Word object) {
-    struct ViewState *state=view_state(object);
-    if (!state->storyboard && object==root_controller) {
-        struct StoryboardResource *board=(void *)storyboard_create(external_class("_OBJC_CLASS_$_UIStoryboard"),"Root storyboard",copy_string(GUEST_LAUNCH_STORYBOARD),(Word)&bundle);
-        Word identifier=map_get((void *)board->metadata,"Root storyboard",copy_string("UIStoryboardDesignatedEntryPointIdentifier"));
-        struct GuestMap *scene=(void *)map_get((void *)board->scenes,"Root storyboard",identifier);
-        if (!scene) stop("Missing root storyboard scene","UIKit");
-        storyboard_attach_controller(board,object,scene);
-    }
-    return state->storyboard;
+    return view_state(object)->storyboard;
 }
 static struct UIKitAlert *storyboard_capability_alert(Word controller) {
      
-    // real controller/stack ownership while making the missing renderer visible.
     Word alert=ui_alert_create(external_class("_OBJC_CLASS_$_UIAlertController"),"Storyboard presentation",
         copy_string("UI unavailable"),copy_string("This interface is not available yet. Please go back."),1);
     Word action=ui_alert_action(external_class("_OBJC_CLASS_$_UIAlertAction"),"Storyboard presentation",copy_string("Back"),1,0);

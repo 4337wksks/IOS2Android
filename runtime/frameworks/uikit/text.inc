@@ -71,21 +71,30 @@ static Word ui_image_named_bundle(Word cls,const char *selector,Word name,Word s
     const char *text=string_bytes(name,selector); const char *extension=strrchr(text,'.');
     if (extension && strchr(extension,'/')) extension=NULL;
     size_t prefix=extension ? (size_t)(extension-text) : strlen(text);
-    const char *suffix=extension ? extension : ".png";
     unsigned preferred=screen_scale()>2 ? 3 : screen_scale()>1 ? 2 : 1;
+    long idiom=(long)device_idiom();
+    if(traits){Method scale=find_implementation(traits,"displayScale"),interface=find_implementation(traits,"userInterfaceIdiom");
+        if(scale){double value=((double (*)(Word,const char *))scale)(traits,"displayScale");if(isfinite(value) && value>0)preferred=value>2 ? 3 : value>1 ? 2 : 1;}
+        if(interface){long value=(long)interface(traits,"userInterfaceIdiom",0,0,0,0);if(value>=0)idiom=value;}
+    }
+    const char *device=idiom==1 ? "~ipad" : idiom==0 ? "~iphone" : "";
+    const char *formats[]={extension ? extension : ".png",".jpg",".jpeg",".heic",".webp",".gif"};
+    const char *at=strrchr(text,'@');unsigned explicit_scale=0;
+    if(at && at<text+prefix){char *end=NULL;unsigned long value=strtoul(at+1,&end,10);if(end && *end=='x' && end<text+prefix && value && value<=UINT_MAX)explicit_scale=(unsigned)value;}
+    const char *device_at=strrchr(text,'~');int explicit_device=device_at && device_at<text+prefix && (!strncmp(device_at,"~iphone",7) || !strncmp(device_at,"~ipad",5));
+    size_t stem=explicit_device ? (size_t)(device_at-text) : prefix,device_length=explicit_device ? prefix-stem : strlen(device);
     unsigned scales[3]={preferred,preferred==3 ? 2 : 1,preferred==3 ? 1 : 3};
-    for (unsigned i=0;i<3;++i) {
-        char filename[PATH_MAX]; unsigned scale=scales[i];
-        int length=scale==1 ? snprintf(filename,sizeof(filename),"%.*s%s",(int)prefix,text,suffix) : snprintf(filename,sizeof(filename),"%.*s@%ux%s",(int)prefix,text,scale,suffix);
-        if (length<0 || (size_t)length>=sizeof(filename)) return 0;
-        Word path=bundle_resource(source ? source : (Word)&bundle,selector,copy_string(filename),0);
-        if (!path) continue;
-        Word data=data_from_file(external_class("_OBJC_CLASS_$_NSData"),selector,path);
-        Word image=image_from_data(cls,selector,(void *)data);
-        if (image) { named_image_state(image)->scale=scale; LOG("Original named image loaded: %s",filename); return image; }
+    for(unsigned format=0;format<(extension ? 1 : COUNT(formats));++format)for(unsigned i=0;i<(explicit_scale ? 1 : 3);++i)for(unsigned variant=0;variant<(*device && !explicit_device ? 2 : 1);++variant){
+        char filename[PATH_MAX],density[32]={0};unsigned scale=explicit_scale ? explicit_scale : scales[i];
+        if(!explicit_scale && scale>1)snprintf(density,sizeof(density),"@%ux",scale);
+        int length=snprintf(filename,sizeof(filename),"%.*s%s%.*s%s",(int)stem,text,density,(int)(explicit_device || variant==0 ? device_length : 0),explicit_device ? device_at : device,formats[format]);
+        if(length<0 || (size_t)length>=sizeof(filename))return 0;
+        Word path=bundle_resource(source ? source : (Word)&bundle,selector,copy_string(filename),0);if(!path)continue;
+        Word data=data_from_file(external_class("_OBJC_CLASS_$_NSData"),selector,path),image=image_from_data(cls,selector,(void *)data);
+        if(image){named_image_state(image)->scale=scale;LOG("Original named image loaded: %s",filename);return image;}
     }
     static unsigned logged;
-    if (logged++<24) LOG("Named image has no standalone PNG resource: %s",text);
+    if (logged++<24) LOG("Named image resource unavailable: %s",text);
     return 0;
 }
 static Word ui_image_named(Word cls,const char *selector,Word name) { return ui_image_named_bundle(cls,selector,name,0,0); }

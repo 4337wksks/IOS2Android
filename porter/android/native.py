@@ -111,7 +111,7 @@ def dependencies(context):
     return outputs
 
 
-def build(context, extension_sources, standalone=False):
+def build(context, extension_sources, standalone=False, adapter=None):
     tools = {name: Path(value) for name, value in context.toolchain.items()}
     work = context.work
     dependencies(context)
@@ -121,6 +121,7 @@ def build(context, extension_sources, standalone=False):
         '#include "' + (ROOT / "runtime/core/runtime.c").as_posix() + '"\n', encoding="utf-8"
     )
     sources = [] if standalone else extension_sources
+    options = adapter.native_options(context, composition) if adapter and hasattr(adapter, "native_options") else []
     run(
         context,
         tools["ndk"] / "bin/clang.exe",
@@ -141,6 +142,7 @@ def build(context, extension_sources, standalone=False):
         "-I" + str(tools["plist"] / "include"),
         "-ffunction-sections",
         "-fdata-sections",
+        *options,
         composition,
         *sources,
         work / "image.S",
@@ -164,6 +166,8 @@ def build(context, extension_sources, standalone=False):
         "-o",
         output,
     )
+    if adapter and hasattr(adapter, "finish_native"):
+        adapter.finish_native(context, output)
     return output
 
 

@@ -133,7 +133,7 @@ static Word notification_types(struct HostObject *settings) { return settings->c
 static Word notification_categories(struct HostObject *settings) { return settings->content[1]; }
 static void did_register_user_notifications(void *context) {
     Method method=find_implementation(app_delegate,"application:didRegisterUserNotificationSettings:");
-    if (method) method(app_delegate,"application:didRegisterUserNotificationSettings:",(Word)&application,(Word)context,0,0);
+    if (method) method(app_delegate,"application:didRegisterUserNotificationSettings:",application_object,(Word)context,0,0);
 }
 static void notification_legacy_authorize(Word,const char *,struct HostObject *);
 static void register_user_notifications(Word self,const char *selector,struct HostObject *requested) { notification_legacy_authorize(self,selector,requested); }
@@ -143,7 +143,7 @@ static Word get_user_notification_settings(void) {
 }
 static void remote_registration_failed(void *context) {
     Method method=find_implementation(app_delegate,"application:didFailToRegisterForRemoteNotificationsWithError:");
-    if (method) method(app_delegate,"application:didFailToRegisterForRemoteNotificationsWithError:",(Word)&application,(Word)context,0,0);
+    if (method) method(app_delegate,"application:didFailToRegisterForRemoteNotificationsWithError:",application_object,(Word)context,0,0);
 }
 static void register_remote_notifications(void) {
     struct GuestMap *info=(void *)empty_map(external_class("_OBJC_CLASS_$_NSDictionary"));
@@ -182,8 +182,8 @@ static Word application_protected_data(void) {
 }
 static void application_lifecycle_event(const char *selector,const char *notification) {
     Method callback=find_implementation(app_delegate,selector);
-    if (callback) callback(app_delegate,selector,(Word)&application,0,0,0);
-    platform_notification(notification,(Word)&application,0);
+    if (callback) callback(app_delegate,selector,application_object,0,0,0);
+    platform_notification(notification,application_object,0);
 #if I2A_DEVELOPMENT
     LOG("[DIAG-lifecycle] %s state=%d tid=%d",selector,__atomic_load_n(&current_application_state,__ATOMIC_ACQUIRE),gettid());
 #endif
@@ -267,7 +267,7 @@ JNIEXPORT jstring JNICALL HOST_JNI(HostActivity_expireBackgroundTask)(JNIEnv *en
         may_unwind=0;
         _Block_release((void *)block);
     }
-    end_background_task((Word)&application,"endBackgroundTask:",(Word)identifier);
+    end_background_task(application_object,"endBackgroundTask:",(Word)identifier);
     return failed ? (*env)->NewStringUTF(env,status) : NULL;
 }
 static unsigned accessibility_state;
@@ -486,7 +486,7 @@ static void notification_cancel_local(Word object,const char *selector,Word loca
 static void notification_show(Word payload,Word options) {
     JNIEnv *env=attached_environment("Notification presentation");Word error=0;jstring text=ui_java_json(env,payload,&error);if(!text)return;
     jclass type=(*env)->GetObjectClass(env,activity);jmethodID method=(*env)->GetMethodID(env,type,"showLocalNotification","(Ljava/lang/String;J)V");(*env)->CallVoidMethod(env,activity,method,text,(jlong)options);(*env)->DeleteLocalRef(env,type);(*env)->DeleteLocalRef(env,text);
-    if(options&1){Word badge=map_get((void *)payload,"Notification badge",copy_string("badge"));if(badge)application_set_badge((Word)&application,"Notification badge",(long)numeric_integer((void *)badge));}
+    if(options&1){Word badge=map_get((void *)payload,"Notification badge",copy_string("badge"));if(badge)application_set_badge(application_object,"Notification badge",(long)numeric_integer((void *)badge));}
 }
 struct NotificationReply { unsigned references,answered;Word payload; };
 struct NotificationReplyBlock { struct Block_layout layout;struct NotificationReply *reply; };
@@ -499,7 +499,7 @@ JNIEXPORT jstring JNICALL HOST_JNI(HostActivity_deliverGuestNotification)(JNIEnv
     if(!application_ready)return NULL;may_unwind=1;int failed=setjmp(boundary);struct NotificationReply *volatile reply=NULL;
     if(!failed){Word string=string_from_java(env,text,"Local notification"),data=encoded_string(string,"Local notification",4),error=0,payload=json_parse(0,"Local notification",(void *)data,0,&error);
         if(!payload)stop("Invalid notification payload","Android notification");Word legacy=map_get((void *)payload,"Local notification",copy_string("legacy"));
-        if(legacy && numeric_bool((void *)legacy)){Word local=notification_from_payload(payload,1,0);Method callback=find_implementation(app_delegate,"application:didReceiveLocalNotification:");if(callback)callback(app_delegate,"application:didReceiveLocalNotification:",(Word)&application,local,0,0);}
+        if(legacy && numeric_bool((void *)legacy)){Word local=notification_from_payload(payload,1,0);Method callback=find_implementation(app_delegate,"application:didReceiveLocalNotification:");if(callback)callback(app_delegate,"application:didReceiveLocalNotification:",application_object,local,0,0);}
         else{Word notice=notification_from_payload(payload,0,1),delegate=user_notification_get_delegate(current_user_notification_center(),"delegate");const char *selector=response ? "userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:" : "userNotificationCenter:willPresentNotification:withCompletionHandler:";Method callback=delegate ? find_implementation(delegate,selector) : NULL;
             if(callback){reply=calloc(1,sizeof(*reply));if(!reply)stop("Allocation failed",selector);reply->references=1;reply->payload=cf_retain(payload);
                 static struct { uintptr_t reserved,size;void (*copy)(void *,const void *);void (*dispose)(const void *); } descriptor={0,sizeof(struct NotificationReplyBlock),notification_reply_copy,notification_reply_dispose};
@@ -545,7 +545,7 @@ static Method ui_notification_method(Word object,const char *selector,const char
         if(!strcmp(selector,"removePendingNotificationRequestsWithIdentifiers:") || !strcmp(selector,"removeDeliveredNotificationsWithIdentifiers:"))return (Method)notification_remove_requests;
         if(!strcmp(selector,"removeAllPendingNotificationRequests") || !strcmp(selector,"removeAllDeliveredNotifications"))return (Method)notification_remove_all;
     }
-    if(object==(Word)&application){
+    if(object==application_object){
         if(!strcmp(selector,"scheduleLocalNotification:"))return (Method)notification_schedule_local;
         if(!strcmp(selector,"cancelLocalNotification:"))return (Method)notification_cancel_local;
         if(!strcmp(selector,"scheduledLocalNotifications"))return (Method)notification_scheduled_local;
@@ -588,7 +588,7 @@ static Method ui_system_method(Word object,const char *selector,const char *rece
         if (!class_receiver && !strcmp(selector,"types")) return (Method)notification_types;
         if (!class_receiver && !strcmp(selector,"categories")) return (Method)notification_categories;
     }
-    if (object==(Word)&application) {
+    if (object==application_object) {
         if (!strcmp(selector,"setDelegate:")) return (Method)application_set_delegate;
         if (!strcmp(selector,"isProtectedDataAvailable")) return (Method)application_protected_data;
         if (!strcmp(selector,"statusBarOrientation")) return (Method)interface_orientation;

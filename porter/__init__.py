@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from pathlib import Path
 
 IMAGE_ABI_VERSION = 1
 RUNTIME_INTERFACE_VERSION = 1
@@ -27,3 +28,9 @@ class BundleIdentity:
 class ImagePatchResult:
     image: str
     files: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class DirectoryOverlay:
+    directory: Path
+    date_time: tuple[int, int, int, int, int, int] | None = None

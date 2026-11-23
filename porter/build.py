@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .files import write_json, build_lock, file_metadata, resolve_file
 from .bundle.identity import inspect_bundle
-from . import ADAPTER_INTERFACE_VERSION, BundleIdentity, versions
+from . import ADAPTER_INTERFACE_VERSION, BundleIdentity, DirectoryOverlay, versions
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -181,7 +181,7 @@ def create_context(
     )
 
 
-def bundle_header(context, source, controller, view, scene):
+def bundle_header(context, source):
     identity = context.identity
     raw = source.read(identity.prefix + "Info.plist")
     catalogue = context.host.get("storekit", {}).get("catalogue", "empty")
@@ -190,9 +190,7 @@ def bundle_header(context, source, controller, view, scene):
     support = context.host.get("helpshift", {})
     native_support = bool(context.host.get("libraries") and support.get("platform_id") and support.get("backend", "auto") in ("auto", "sdk"))
     fields = dict(
-        ROOT_CONTROLLER=controller,
-        ROOT_VIEW=view,
-        GUEST_LAUNCH_STORYBOARD=context.info["UIMainStoryboardFile"],
+        GUEST_MAIN_STORYBOARD=context.info.get("UIMainStoryboardFile") or "",
         BUNDLE_ID=identity.identifier,
         GUEST_BUNDLE_NAME=identity.directory,
         GUEST_EXECUTABLE=identity.executable,
@@ -209,12 +207,8 @@ def bundle_header(context, source, controller, view, scene):
         "#define STOREKIT_EMPTY_CATALOGUE " + str(int(catalogue == "empty")),
         "#define HELPSHIFT_NATIVE_BACKEND " + str(int(native_support)),
         "#define GUEST_APP_BUILD " + str(context.version_code),
-        "static const char storyboard_scene[] = "
-        + json.dumps(json.dumps(scene, separators=(",", ":")))
-        + ";",
     ]
     (context.work / "bundle.h").write_text("\n".join(header) + "\n", encoding="utf-8")
-    write_json(context.work / "storyboard-scene.json", scene)
 
 
 def interface_catalogue(context):
@@ -249,7 +243,7 @@ def build(context, core_only=False):
     from .android import native, package
     from .bundle.asset_catalog import prepare_asset_catalog
     from .bundle.identity import font_plan, prepare_app_identity
-    from .bundle.storyboard import launch_scene, prepare_controller_catalogue, prepare_launch_screen
+    from .bundle.storyboard import prepare_controller_catalogue, prepare_launch_screen
     from .image.macho import prepare_image
     from .shaders.build import build_shader_pack
 
@@ -275,13 +269,8 @@ def build(context, core_only=False):
             if context.development:
                 interface_catalogue(context)
             event("bundle")
-            if not context.info.get("UIMainStoryboardFile"):
-                raise ValueError("This runtime currently requires a supported main storyboard")
-            controller, view, scene = launch_scene(
-                source, context.identity.prefix, context.info["UIMainStoryboardFile"]
-            )
             prepare_controller_catalogue(source, context.identity.prefix, context.work)
-            bundle_header(context, source, controller, view, scene)
+            bundle_header(context, source)
             _, resources = prepare_app_identity(
                 source, context.identity.prefix, context.info, context.work
             )
@@ -293,13 +282,18 @@ def build(context, core_only=False):
             )
             launch_screen = prepare_launch_screen(source, context.identity.prefix, context.info, resources, catalog) if not core_only else None
             overlays = adapter.resources(context, source) if adapter else {}
-            for name in overlays:
-                if (
-                    name.startswith("/")
-                    or ".." in Path(name).parts
-                    or context.identity.prefix + name not in source.namelist()
-                ):
+            members = set(source.namelist())
+            for name, overlay in overlays.items():
+                directory = isinstance(overlay, DirectoryOverlay)
+                exists = (
+                    any(member.startswith(context.identity.prefix + name.rstrip("/") + "/") for member in members)
+                    if directory
+                    else context.identity.prefix + name in members
+                )
+                if name.startswith("/") or ".." in Path(name).parts or not exists:
                     raise ValueError("Overlay must target an existing bundle resource: " + name)
+                if directory and not overlay.directory.is_dir():
+                    raise ValueError("Missing resource overlay directory: " + str(overlay.directory))
             revision = uuid.uuid4().hex[:12]
             event("shaders")
             if adapter:
@@ -323,7 +317,7 @@ def build(context, core_only=False):
                 if adapter
                 else []
             )
-            library = native.build(context, extension_sources, standalone=core_only)
+            library = native.build(context, extension_sources, standalone=core_only, adapter=adapter)
             if core_only:
                 write_json(
                     context.work / "build.json",
@@ -333,7 +327,7 @@ def build(context, core_only=False):
                 return library
             event("host")
             fonts = font_plan(context, source)
-            manifest, dex = package.build_host(context, revision, fonts, resources, launch_screen)
+            manifest, dex = package.build_host(context, revision, fonts, resources, launch_screen, adapter)
             event("package")
             candidate = package.build_apk(
                 context, source, manifest, resources, catalog, overlays, library, dex, adapter

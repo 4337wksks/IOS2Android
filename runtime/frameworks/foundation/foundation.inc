@@ -249,7 +249,9 @@ static Word split_string(Word self,const char *selector,Word delimiter) {
 }
 
 static Word data_from_file(Word cls,const char *selector,Word filename) {
-    int fd=io_open(string_bytes(filename,selector),O_RDONLY|O_CLOEXEC,0);
+    const char *path=string_bytes(filename,selector),*relative=bundle_relative(path);
+    if (relative) return bundle_data(cls,relative);
+    int fd=io_open(path,O_RDONLY|O_CLOEXEC,0);
     if (fd<0) return 0;
     struct stat info;
     if (io_fstat(fd,&info) || info.st_size<0 || (uint64_t)info.st_size>SIZE_MAX-sizeof(struct HostObject)) { io_close(fd); return 0; }
@@ -388,43 +390,37 @@ static Word bundle_receipt(Word self,const char *selector) {
 static Word bundle_resource(Word self,const char *selector,Word name,Word type) {
     if (!name) return 0;
     Word filename=type && *string_bytes(type,selector) ? append_path_extension(name,selector,type) : name;
-    Word logical=append_path(bundle_path(self),selector,filename);
+    Word root=bundle_path(self),logical=append_path(root,selector,filename);
     const char *logical_path=string_bytes(logical,selector);
-    const char *relative_path=bundle_relative(logical_path);
-    if (relative_path) {
+    struct stat info;if (!io_stat(logical_path,&info)) return logical;
+    {
         JNIEnv *env=attached_environment(selector);
-        jstring relative=(*env)->NewStringUTF(env,relative_path);
-        jboolean exists=(*env)->CallBooleanMethod(env,activity,bundle_exists_method,relative);
-        (*env)->DeleteLocalRef(env,relative);
-        return exists ? logical : 0;
+        static jmethodID method;if (!method) {jclass cls=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,cls,"localizedBundleResource","(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");(*env)->DeleteLocalRef(env,cls);}
+        Word development=bundle_info_key(self,selector,copy_string("CFBundleDevelopmentRegion"));
+        jstring base=(*env)->NewStringUTF(env,string_bytes(root,selector)),file=(*env)->NewStringUTF(env,string_bytes(filename,selector));
+        jstring language=development ? (*env)->NewStringUTF(env,string_bytes(development,selector)) : NULL;
+        jstring result=(*env)->CallObjectMethod(env,activity,method,base,file,language);Word path=0;
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);else if (result) path=string_from_java(env,result,selector);
+        if (result) (*env)->DeleteLocalRef(env,result);if (language) (*env)->DeleteLocalRef(env,language);(*env)->DeleteLocalRef(env,base);(*env)->DeleteLocalRef(env,file);
+        return path;
     }
-    char *path=native_path(string_bytes(logical,selector));
-    if (!path) return 0;
-    int found=access(path,R_OK)==0;
-    free(path);
-    return found ? logical : 0;
 }
+static Word bundle_resource_directory(Word self,const char *selector,Word name,Word type,Word directory) {return bundle_resource(self,selector,directory && name ? append_path(directory,selector,name) : name,type);}
+static Word bundle_resource_localization(Word self,const char *selector,Word name,Word type,Word directory,Word localization) {
+    if (!localization) return bundle_resource_directory(self,selector,name,type,directory);if (!name) return 0;
+    Word filename=type && *string_bytes(type,selector) ? append_path_extension(name,selector,type) : name;
+    if (directory) filename=append_path(directory,selector,filename);
+    Word folder=append_path_extension(localization,selector,copy_string("lproj"));Word path=append_path(append_path(bundle_path(self),selector,folder),selector,filename);struct stat info;
+    return !io_stat(string_bytes(path,selector),&info) ? path : 0;
+}
+static Word bundle_resource_url(Word self,const char *selector,Word name,Word type) {Word path=bundle_resource(self,selector,name,type);return path ? file_url(path) : 0;}
+static Word bundle_resource_directory_url(Word self,const char *selector,Word name,Word type,Word directory) {Word path=bundle_resource_directory(self,selector,name,type,directory);return path ? file_url(path) : 0;}
+static Word bundle_resource_localization_url(Word self,const char *selector,Word name,Word type,Word directory,Word localization) {Word path=bundle_resource_localization(self,selector,name,type,directory,localization);return path ? file_url(path) : 0;}
 
 static Word bundle_localized(Word self,const char *selector,Word key,Word fallback,Word table) {
-    Word root=bundle_path(self);
     Word filename=append_path_extension(table ? table : copy_string("Localizable"),selector,copy_string("strings"));
-    Word direct=append_path(root,selector,filename);
-    Word strings=dictionary_from_file(external_class("_OBJC_CLASS_$_NSDictionary"),selector,direct);
-    if (!strings) {
-        char language[160];
-        Word current=system_text("locale");
-        snprintf(language,sizeof(language),"%s",current ? string_bytes(current,selector) : "en");
-        char *suffix=strchr(language,'_');
-        if (suffix) *suffix=0;
-        if (!strcmp(language,"zh")) snprintf(language,sizeof(language),"zh-Hans");
-        const char *choices[]={language,"Base","en"};
-        for (unsigned index=0;index<COUNT(choices) && !strings;++index) {
-            char directory[180];
-            snprintf(directory,sizeof(directory),"%s.lproj",choices[index]);
-            Word path=append_path(append_path(root,selector,copy_string(directory)),selector,filename);
-            strings=dictionary_from_file(external_class("_OBJC_CLASS_$_NSDictionary"),selector,path);
-        }
-    }
+    Word path=bundle_resource(self,selector,filename,0);
+    Word strings=path ? dictionary_from_file(external_class("_OBJC_CLASS_$_NSDictionary"),selector,path) : 0;
     Word value=strings ? map_get((void *)strings,selector,key) : 0;
     return value ? value : fallback && *string_bytes(fallback,selector) ? fallback : key;
 }
@@ -583,7 +579,7 @@ static Method foundation_method(Word object,const char *selector,const char *rec
     if (!strcmp(selector,"autorelease")) return (Method)metal_object_autorelease;
     if (!strcmp(selector,"release")) return (Method)metal_object_release;
     if (!strcmp(selector,"conformsToProtocol:")) return (Method)conforms_protocol;
-    if (!class_receiver && !strcmp(selector,"description")) return (Method)object_description;
+    if (!strcmp(selector,"description") || !strcmp(selector,"debugDescription")) return (Method)object_description;
     if (object==(Word)&defaults && !strcmp(selector,"synchronize")) return (Method)synchronized_defaults;
     if (!strcmp(receiver,"_OBJC_CLASS_$_NSNumber")) {
         const char *const constructors[]={"numberWithInteger:","numberWithUnsignedInteger:","numberWithInt:","numberWithUnsignedInt:",
@@ -606,7 +602,7 @@ static Method foundation_method(Word object,const char *selector,const char *rec
         if (!strcmp(selector,"alloc") || !strcmp(selector,"allocWithZone:")) return (Method)host_allocate;
         if (!strcmp(selector,"new")) return (Method)new_object;
     }
-    if (!class_receiver && !strcmp(selector,"init") && !in_image(read_word(object))) return (Method)identity;
+    if (!class_receiver && !strcmp(selector,"init") && class_inherits(read_word(object),external_class("_OBJC_CLASS_$_NSObject"))) return (Method)identity;
     int set=!strcmp(receiver,"_OBJC_CLASS_$_NSSet") || !strcmp(receiver,"_OBJC_CLASS_$_NSMutableSet");
     int array=!strcmp(receiver,"_OBJC_CLASS_$_NSArray") || !strcmp(receiver,"_OBJC_CLASS_$_NSMutableArray");
     int mutable=!strcmp(receiver,"_OBJC_CLASS_$_NSMutableArray") || !strcmp(receiver,"_OBJC_CLASS_$_NSMutableSet");
@@ -672,6 +668,11 @@ static Method foundation_method(Word object,const char *selector,const char *rec
         if (!class_receiver && !strcmp(selector,"appStoreReceiptURL")) return (Method)bundle_receipt;
         if (!class_receiver && (!strcmp(selector,"bundlePath") || !strcmp(selector,"resourcePath"))) return (Method)bundle_path;
         if (!class_receiver && !strcmp(selector,"pathForResource:ofType:")) return (Method)bundle_resource;
+        if (!class_receiver && !strcmp(selector,"pathForResource:ofType:inDirectory:")) return (Method)bundle_resource_directory;
+        if (!class_receiver && !strcmp(selector,"pathForResource:ofType:inDirectory:forLocalization:")) return (Method)bundle_resource_localization;
+        if (!class_receiver && !strcmp(selector,"URLForResource:withExtension:")) return (Method)bundle_resource_url;
+        if (!class_receiver && !strcmp(selector,"URLForResource:withExtension:subdirectory:")) return (Method)bundle_resource_directory_url;
+        if (!class_receiver && !strcmp(selector,"URLForResource:withExtension:subdirectory:localization:")) return (Method)bundle_resource_localization_url;
         if (!class_receiver && !strcmp(selector,"localizedStringForKey:value:table:")) return (Method)bundle_localized;
     }
     if (!strcmp(receiver,"_OBJC_CLASS_$_UIImage")) {

@@ -143,15 +143,17 @@ class Catalog:
                     pixels.extend([min(255,(c*255+alpha//2)//alpha) if alpha else 0 for c in (red,green,blue)]+[alpha])
         result=(w,h,scale,bytes(pixels));self.decoded[block]=result;return result
 
-    def images(self, exclusions=()):
+    def images(self, exclusions=(), unsupported=None):
         for token,name_block in self.tree('FACETKEYS'):
-            name=self.blocks[name_block].decode('utf8');attrs=self.attributes(self.blocks[token],0)
+            name=self.blocks[name_block].rstrip(b'\0').decode('utf8');attrs=self.attributes(self.blocks[token],0)
             if name=='AppIcon':continue # Launcher icons already use Info.plist's exact standalone resources.
             for key,block in self.renditions:
                 if all(key.get(k,0)==v for k,v in attrs.items()):
                     try:w,h,scale,pixels=self.decode(block)
                     except ValueError as e:
                         if any(rule['name']==name and key.get(rule['key'])==rule['value'] for rule in exclusions):continue
+                        if unsupported is not None and (str(e).startswith('Unsupported ') or str(e)=='Non-bitmap rendition'):
+                            unsupported.append(dict(name=name,reason=str(e)));continue
                         raise ValueError(f'{name}: {e}') from e
                     suffix='' if scale==100 else '@'+str(scale//100)+'x'
                     yield name+suffix+'.png',png(w,h,pixels)
@@ -159,17 +161,26 @@ class Catalog:
 
 def prepare_asset_catalog(source,prefix,work,exclusions=()):
     root=work/'catalog-assets';root.mkdir(exist_ok=True)
-    if prefix+'Assets.car' not in source.namelist():
+    members=sorted((item for item in source.infolist() if item.filename.startswith(prefix) and item.filename.endswith('/Assets.car')),key=lambda item:item.filename)
+    if not members:
         (root/'manifest.json').write_text(json.dumps({'images':[]}),encoding='utf-8')
         return []
-    member=source.getinfo(prefix+'Assets.car')
-    inputs=dict(crc=member.CRC,bytes=member.file_size,exclusions=exclusions,generator=file_metadata([Path(__file__)]))
+    inputs=dict(catalogues=[dict(path=member.filename,crc=member.CRC,bytes=member.file_size) for member in members],exclusions=exclusions,generator=file_metadata([Path(__file__)]))
     stamp=root/'manifest.json'
     if stamp.exists():
         manifest=json.loads(stamp.read_text())
         if manifest.get('inputs')==inputs and all((root/name).is_file() for name in manifest['images']):return [(name,root/name) for name in manifest['images']]
-    raw=source.read(prefix+'Assets.car')
-    images=list(Catalog(raw).images(exclusions))
-    for name,data in images:(root/name).write_bytes(data)
-    stamp.write_text(json.dumps({'inputs':inputs,'images':[name for name,_ in images]},indent=2),encoding='utf8')
-    return [(name,root/name) for name,_ in images]
+    images=[];unsupported=[]
+    for member in members:
+        folder=member.filename[len(prefix):].removesuffix('Assets.car')
+        unavailable=[]
+        for name,data in Catalog(source.read(member)).images(exclusions if not folder else (),unavailable):
+            target=folder+name
+            destination=root/target
+            if not destination.resolve().is_relative_to(root.resolve()):raise ValueError('Catalog image path escapes its output directory')
+            destination.parent.mkdir(parents=True,exist_ok=True)
+            destination.write_bytes(data);images.append(target)
+        for item in unavailable:unsupported.append(dict(path=member.filename,name=item['name'],reason=item['reason']))
+    if unsupported:print(f'CoreUI: {len(unsupported)} renditions have no bitmap conversion; original catalogues are retained')
+    stamp.write_text(json.dumps({'inputs':inputs,'images':images,'unsupported':unsupported},indent=2),encoding='utf8')
+    return [(name,root/name) for name in images]

@@ -17,6 +17,12 @@ static void view_set_frame(Word,const char *,struct GuestRect);
 static int ui_view_rendered(Word);
 static void ui_view_load_content(Word,const char *,const double *);
 static void ui_view_request_display(Word,const char *);
+static void ui_view_load_label(Word,plist_t);
+static Word storyboard_startup(Word);
+static void load_storyboard_view(Word,Word);
+static void window_schedule_presentation(Word);
+static void window_set_hidden(Word,const char *,unsigned char);
+static int window_lifecycle_ready;
 struct ViewOpacity { Word object; float before; struct ViewOpacity *next; };
 struct ViewAnimation { struct ViewOpacity *items,*sources; struct ViewAnimation *previous; };
 static _Thread_local struct ViewAnimation *view_animation;
@@ -24,7 +30,7 @@ static void view_animation_capture(Word);
 static void view_animation_change(Word);
 struct ViewState {
     Word object,parent,children,layer,controller,view,owner_window,image_name,background,presented,presenting,modal_alert,popover,navigation_bar,storyboard,nib_name,nib_bundle;
-    Word navigation_item,title,prompt,left_item,right_item,back_item;
+    Word navigation_item,title,prompt,left_item,right_item,back_item,archived_graph;
     void *control,*web,*scroll,*input;
     Word accessibility_label;
     Word constraints,gestures;
@@ -40,14 +46,17 @@ struct ViewState {
     Method display_method;
     Method intrinsic_method;unsigned intrinsic_epoch,intrinsic_checked;
     unsigned display_epoch;
+    unsigned appearance_pending,appeared;
     struct ViewState *next;
 };
 static struct ViewState *view_states;
+static struct ViewState *existing_view_state(Word object){for(struct ViewState *state=view_states;state;state=state->next)if(state->object==object)return state;return NULL;}
 static struct ViewState *view_state(Word object) {
-    for (struct ViewState *state=view_states;state;state=state->next) if (state->object==object) return state;
+    struct ViewState *known=existing_view_state(object);if(known)return known;
     struct ViewState *state=calloc(1,sizeof(*state));
     if (!state) stop("Allocation failed","UIView state");
     state->object=object; state->alpha=1; state->scale=screen_scale(); state->interaction=1; state->autoresizes=1; state->translates=1;
+    state->hidden=class_inherits(read_word(object),external_class("_OBJC_CLASS_$_UIWindow"));
     state->margins=(struct GuestRect){8,8,8,8};
     state->edges=15; state->automatic_insets=1; state->clears_selection=1; state->opaque=!class_inherits(read_word(object),external_class("_OBJC_CLASS_$_UILabel"));
     state->children=sequence_empty(external_class("_OBJC_CLASS_$_NSMutableArray"));
@@ -57,7 +66,6 @@ static struct ViewState *view_state(Word object) {
 static Word application_windows(void) {
     struct Sequence *windows=(void *)sequence_empty(external_class("_OBJC_CLASS_$_NSArray"));
     for(struct ViewState *state=view_states;state;state=state->next)if(class_inherits(read_word(state->object),external_class("_OBJC_CLASS_$_UIWindow")))sequence_add(windows,"windows",state->object);
-    if(main_window.isa && !sequence_contains(windows,"windows",(Word)&main_window))sequence_add(windows,"windows",(Word)&main_window);
     return (Word)windows;
 }
 static void view_sync_subtree(Word object) {
@@ -150,7 +158,7 @@ static void view_set_center(Word object,const char *selector,struct GuestPoint c
     state->frame.x=center.x-state->frame.width*0.5; state->frame.y=center.y-state->frame.height*0.5;
     view_sync_subtree(object);
 }
-static void view_hidden(Word object,const char *selector,unsigned char hidden) { view_state(object)->hidden=hidden!=0; view_sync_subtree(object); }
+static void view_hidden(Word object,const char *selector,unsigned char hidden) {if(class_inherits(read_word(object),external_class("_OBJC_CLASS_$_UIWindow"))){window_set_hidden(object,selector,hidden);return;}view_state(object)->hidden=hidden!=0; view_sync_subtree(object);}
 static Word view_is_hidden(Word object) { return view_state(object)->hidden; }
 static void view_alpha(Word object,const char *selector,double alpha) { if (view_animation) view_animation_change(object); view_state(object)->alpha=fmin(1,fmax(0,alpha)); view_sync_subtree(object); }
 static double view_get_alpha(Word object) { return view_state(object)->alpha; }
@@ -255,30 +263,32 @@ static Word view_layer(Word object) {
     }
     return state->layer;
 }
+static void controller_load_view(Word object,const char *selector) {
+    struct ViewState *state=view_state(object);
+    if (state->archived_graph) { load_storyboard_view(object,state->archived_graph); return; }
+    if (state->deferred_storyboard || state->nib_name) stop("Archived controller view decoding unavailable",selector);
+    Word cls=read_word(object),view_cls=external_class(class_inherits(cls,external_class("_OBJC_CLASS_$_UITableViewController")) ? "_OBJC_CLASS_$_UITableView" : "_OBJC_CLASS_$_UIView");
+    state->view=view_init_frame(host_allocate(view_cls),selector,screen_bounds());
+}
 static Word controller_view(Word object) {
     struct ViewState *state=view_state(object);
-    if (!state->view && object==root_controller) state->view=(Word)&root_view;
     if (!state->view && !state->loading_view) {
         state->loading_view=1;
         Method load=find_implementation(object,"loadView");
         if (load) load(object,"loadView",0,0,0,0);
-        else {
-            if (state->deferred_storyboard || state->nib_name) { state->loading_view=0; stop("Archived controller view decoding unavailable","loadView"); }
-            Word cls=read_word(object),view_cls=external_class(class_inherits(cls,external_class("_OBJC_CLASS_$_UITableViewController")) ? "_OBJC_CLASS_$_UITableView" : "_OBJC_CLASS_$_UIView");
-            state->view=view_init_frame(host_allocate(view_cls),"loadView",screen_bounds());
-        }
+        else controller_load_view(object,"loadView");
         state->loading_view=0;
         if (!state->view) stop("Controller loadView did not set a view",class_name(read_word(object)));
         view_state(state->view)->controller=object;
-        if (!state->view_did_load) {
-            state->view_did_load=1; Method loaded=find_implementation(object,"viewDidLoad");
-            if (loaded) loaded(object,"viewDidLoad",0,0,0,0);
-        }
     }
-    if (state->view) view_state(state->view)->controller=object;
+    if (state->view) {
+        view_state(state->view)->controller=object;
+        if(!state->view_did_load && !state->loading_view){state->view_did_load=1;Method loaded=find_implementation(object,"viewDidLoad");if(loaded)loaded(object,"viewDidLoad",0,0,0,0);}
+    }
     return state->view;
 }
 static Word controller_loaded_view(Word object) { return view_state(object)->view; }
+static void controller_load_if_needed(Word object,const char *selector) { controller_view(object); }
 static Word controller_init_nib(Word object,const char *selector,Word name,Word bundle) {
     struct ViewState *state=view_state(object);
     state->nib_name=name ? text_copy(name,"copy") : 0; state->nib_bundle=bundle;
@@ -413,8 +423,8 @@ static Word controller_navigation_bar(Word object) {
 }
 static Word navigation_bar_style(Word object) { return view_state(object)->bar_style; }
 static void navigation_bar_set_style(Word object,const char *selector,long style) { view_state(object)->bar_style=style; }
-static Word controller_nib_name(Word object) { if (object==root_controller) controller_storyboard(object); return view_state(object)->nib_name; }
-static Word controller_nib_bundle(Word object) { if (object==root_controller) controller_storyboard(object); return view_state(object)->nib_bundle; }
+static Word controller_nib_name(Word object) { return view_state(object)->nib_name; }
+static Word controller_nib_bundle(Word object) { return view_state(object)->nib_bundle; }
 static Word navigation_top(Word object) {
     struct Sequence *children=(void *)view_state(object)->children;
     return children->count ? children->items[children->count-1] : 0;
@@ -492,17 +502,45 @@ static void window_set_controller(Word object,const char *selector,Word controll
     struct ViewState *window=view_state(object);
     if (window->controller && window->controller!=controller) {
         struct ViewState *previous=view_state(window->controller);
+        previous->appeared=0;
         if (previous->view) view_remove(previous->view);
         previous->owner_window=0;
     }
     window->controller=controller;
+    if(object==key_window)root_controller=controller;
     if (controller) {
         view_state(controller)->owner_window=object;
-        Word view=controller_view(controller);
-        if (view && view_state(view)->parent!=object) view_add(object,selector,view);
-        if (view_state(controller)->edges!=15) controller_geometry(controller);
+        if(!window->hidden)window_schedule_presentation(object);
     }
 }
+static void window_present(void *value) {
+    Word object=(Word)value;struct ViewState *window=view_state(object);window->appearance_pending=0;
+    Word controller=window->controller;if(window->hidden || !controller || !window_lifecycle_ready)return;
+    struct ViewState *state=view_state(controller);Word view=controller_view(controller);if(!view)return;
+    if(!state->appeared){Method callback=find_implementation(controller,"viewWillAppear:");if(callback)callback(controller,"viewWillAppear:",0,0,0,0);}
+    if(window->hidden || window->controller!=controller)return;
+    if(view_state(view)->parent!=object)view_add(object,"Window presentation",view);
+    controller_geometry(controller);view_request_layout(view,"Window presentation");view_layout_if_needed(view,"Window presentation");view_sync_subtree(view);
+    if(!state->appeared){state->appeared=1;Method callback=find_implementation(controller,"viewDidAppear:");if(callback)callback(controller,"viewDidAppear:",0,0,0,0);}
+    JNIEnv *env=attached_environment("Window presentation");static jmethodID ready;if(!ready){jclass cls=(*env)->GetObjectClass(env,activity);ready=(*env)->GetMethodID(env,cls,"guestWindowReady","()V");(*env)->DeleteLocalRef(env,cls);}(*env)->CallVoidMethod(env,activity,ready);
+    if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);stop("Android window presentation failed","UIWindow");}
+}
+static void window_schedule_presentation(Word object){struct ViewState *state=view_state(object);if(window_lifecycle_ready && !state->hidden && !state->appearance_pending){state->appearance_pending=1;schedule_main_function(window_present,(void *)object);}}
+static Word window_is_key(Word object){return key_window==object;}
+static void window_become_key(Word object,const char *selector){key_window=object;root_controller=view_state(object)->controller;}
+static void window_resign_key(Word object,const char *selector){if(key_window==object){key_window=0;root_controller=0;}}
+static void window_make_key(Word object,const char *selector){
+    if(key_window==object)return;Word previous=key_window;
+    if(previous){Method callback=find_implementation(previous,"resignKeyWindow");if(callback)callback(previous,"resignKeyWindow",0,0,0,0);platform_notification("UIWindowDidResignKeyNotification",previous,0);}
+    window_become_key(object,selector);Method callback=find_implementation(object,"becomeKeyWindow");if(callback && callback!=(Method)window_become_key)callback(object,"becomeKeyWindow",0,0,0,0);platform_notification("UIWindowDidBecomeKeyNotification",object,0);
+}
+static void window_set_hidden(Word object,const char *selector,unsigned char hidden){
+    struct ViewState *state=view_state(object);int changed=state->hidden!=(hidden!=0);state->hidden=hidden!=0;
+    if(state->hidden && state->controller){struct ViewState *controller=view_state(state->controller);if(controller->appeared){controller->appeared=0;Method before=find_implementation(state->controller,"viewWillDisappear:"),after=find_implementation(state->controller,"viewDidDisappear:");if(before)before(state->controller,"viewWillDisappear:",0,0,0,0);view_sync_subtree(object);if(after)after(state->controller,"viewDidDisappear:",0,0,0,0);}}
+    if(changed && window_lifecycle_ready)platform_notification(hidden ? "UIWindowDidBecomeHiddenNotification" : "UIWindowDidBecomeVisibleNotification",object,0);
+    if(!hidden)window_schedule_presentation(object);view_sync_subtree(object);
+}
+static void window_make_visible(Word object,const char *selector){window_make_key(object,selector);window_set_hidden(object,selector,0);}
 static void view_set_clips(Word object,const char *selector,Word clips) { struct ViewState *view=view_state(object);if(view->clips==(clips!=0))return;view->clips=clips!=0;view_sync_subtree(object); }
 static Word view_clips(Word object) { return view_state(object)->clips; }
 static void layer_set_masks(Word object,const char *selector,Word masks) { view_state(object)->clips=masks!=0; ui_label_sync(view_state(object)->view); }
@@ -932,13 +970,18 @@ static Word constraint_visual_format(Word cls,const char *selector,Word format,W
         for (size_t i=1;i<layout.items->count;++i) visual_constraint(&layout,layout.items->items[i],attribute,0,layout.items->items[0],attribute,0,1000);
     free(layout.items->items); free(layout.items); return (Word)layout.constraints;
 }
-static void load_storyboard_view(void) {
+static void scene_graph_attribute(double *row,plist_t views,int node,int attribute,double factor){
+    if(node<0)return;unsigned count=plist_array_get_size(views);if((unsigned)node>=count)stop("Invalid archived layout item","Storyboard");scene_attribute(row,node,attribute,factor);
+    int axis=(attribute==1 || attribute==2 || attribute==5 || attribute==6 || attribute==9) ? 0 : (attribute==3 || attribute==4 || attribute==10) ? 1 : -1;if(axis<0)return;
+    for(unsigned depth=0;depth<count;++depth){int parent=(int)scene_number(plist_array_get_item(views,node),"parent",-1);if(parent<0)return;if((unsigned)parent>=(unsigned)node)stop("Invalid archived view hierarchy","Storyboard");row[parent*4+axis]+=factor;node=parent;}
+}
+static void load_storyboard_view(Word controller,Word graph) {
     plist_t scene=NULL;
-    if (plist_from_json(storyboard_scene,sizeof(storyboard_scene)-1,&scene)!=PLIST_ERR_SUCCESS) stop("Invalid generated storyboard","UIKit");
+    const char *encoded=string_bytes(graph,"Storyboard view");if (plist_from_json(encoded,strlen(encoded),&scene)!=PLIST_ERR_SUCCESS) stop("Invalid generated storyboard","UIKit");
     plist_t views=plist_dict_get_item(scene,"views"),constraints=plist_dict_get_item(scene,"constraints");
     unsigned count=plist_array_get_size(views),variables=count*4;
-    if (!count || count>32) stop("Unexpected startup scene size","UIKit");
-    Word objects[32]={0};
+    if (!count || count>128) stop("Archived layout exceeds supported size","UIKit");
+    Word *objects=calloc(count,sizeof(*objects));if(!objects)stop("Allocation failed","Storyboard views");
     double *basis=calloc(variables*(variables+1),sizeof(double)),*row=calloc(variables+1,sizeof(double)),*values=calloc(variables,sizeof(double));
     if (!basis || !row || !values) stop("Allocation failed","Storyboard constraints");
     struct GuestRect screen=screen_bounds();
@@ -949,8 +992,8 @@ static void load_storyboard_view(void) {
         if ((int)scene_number(constraint,"priority",1000)!=priority) continue;
         if (scene_number(constraint,"relation",0)!=0) stop("Unsupported startup constraint relation","Storyboard");
         memset(row,0,(variables+1)*sizeof(double));
-        scene_attribute(row,(int)scene_number(constraint,"first",-1),(int)scene_number(constraint,"attribute",0),1);
-        scene_attribute(row,(int)scene_number(constraint,"second",-1),(int)scene_number(constraint,"otherAttribute",0),-scene_number(constraint,"multiplier",1));
+        scene_graph_attribute(row,views,(int)scene_number(constraint,"first",-1),(int)scene_number(constraint,"attribute",0),1);
+        scene_graph_attribute(row,views,(int)scene_number(constraint,"second",-1),(int)scene_number(constraint,"otherAttribute",0),-scene_number(constraint,"multiplier",1));
         row[variables]=scene_number(constraint,"constant",0);
         scene_equation(basis,variables,row,priority==1000);
     }
@@ -974,8 +1017,7 @@ static void load_storyboard_view(void) {
         const char *name=plist_get_string_ptr(plist_dict_get_item(node,"class"),NULL);
         Word cls=class_from_name(name);
         if (!cls) stop("Unknown storyboard view class",name);
-        objects[i]=i ? host_allocate(cls) : (Word)&root_view;
-        *(Word *)objects[i]=cls;
+        objects[i]=host_allocate(cls);
         struct GuestRect frame={values[i*4],values[i*4+1],values[i*4+2],values[i*4+3]};
         view_init_frame(objects[i],"Storyboard",frame);
         struct ViewState *state=view_state(objects[i]);
@@ -986,35 +1028,43 @@ static void load_storyboard_view(void) {
         if (plist_get_node_type(background)!=PLIST_ARRAY) background=NULL;
         for (unsigned j=0;j<4;++j) { rgba[j]=0; if (background) plist_get_real_val(plist_array_get_item(background,j),rgba+j); }
         ui_view_load_content(objects[i],string_bytes(state->image_name,"Storyboard image"),background ? rgba : NULL);
+        if(class_inherits(cls,external_class("_OBJC_CLASS_$_UILabel")))ui_view_load_label(objects[i],node);
         int parent=(int)scene_number(node,"parent",-1);
         if (parent>=0) {
-            if (parent!=0 || (unsigned)parent>=i) stop("Unsupported nested startup layout","Storyboard");
+            if ((unsigned)parent>=i) stop("Invalid archived view hierarchy","Storyboard");
             view_add(objects[parent],"Storyboard",objects[i]);
         }
     }
-    view_state(root_controller)->view=objects[0];
-    view_init_frame((Word)&main_window,"Window",screen);
-    window_set_controller((Word)&main_window,"Window",root_controller);
+    view_state(controller)->view=objects[0];
     LOG("Original storyboard restored: %u views, %u constraints, original images loaded",count,plist_array_get_size(constraints));
-    free(basis); free(row); free(values); plist_free(scene);
+    free(objects);free(basis); free(row); free(values); plist_free(scene);
 }
-static void load_application_view(void) {
-    load_storyboard_view();
-    const char *selector="viewDidLoad";
-    Method load=find_implementation(root_controller,selector);
-    if (!load) stop("Missing viewDidLoad",ROOT_CONTROLLER);
-    snprintf(stage,sizeof(stage),"Original %s viewDidLoad 0x%lx",ROOT_CONTROLLER,(Word)load-aslr+GUEST_IMAGE_BASE);
-    LOG("%s",stage);
-    load(root_controller,selector,0,0,0,0);
-    LOG("Original root viewDidLoad returned");
-}
-static void finish_application_lifecycle(void) {
-    const char *selectors[]={"viewWillAppear:","viewDidLayoutSubviews","viewDidAppear:"};
-    for (unsigned i=0;i<COUNT(selectors);++i) {
-        Method callback=find_implementation(root_controller,selectors[i]);
-        if (callback) callback(root_controller,selectors[i],0,0,0,0);
+static void application_activate(void *unused) { application_lifecycle_start(); }
+static void ui_application_start(Word principal,Word delegate_name){
+    application.isa=external_class("_OBJC_CLASS_$_UIApplication");application_object=(Word)&application;
+    if(principal){
+        Word cls=class_from_string(principal);if(!cls || !class_inherits(cls,application.isa))stop("Invalid application principal","UIApplicationMain");
+        application_object=host_allocate(cls);Method initializer=find_implementation(application_object,"init");
+        if(!initializer)stop("Missing application initializer","UIApplicationMain");
+        application_object=initializer(application_object,"init",0,0,0,0);
+        if(!application_object)stop("Application initialization failed","UIApplicationMain");
     }
-    application_lifecycle_start();
+    if(delegate_name){Word cls=class_from_string(delegate_name);if(!cls)stop("Unknown application delegate","UIApplicationMain");app_delegate=new_object(cls);}
+    Word managed=0;
+    if(*GUEST_MAIN_STORYBOARD){
+        Word controller=storyboard_startup(copy_string(GUEST_MAIN_STORYBOARD));
+        if(controller){
+            main_window.isa=external_class("_OBJC_CLASS_$_UIWindow");managed=(Word)&main_window;
+            view_init_frame(managed,"Main storyboard window",screen_bounds());window_set_controller(managed,"setRootViewController:",controller);window_make_key(managed,"Main storyboard window");
+            Method setter=find_implementation(app_delegate,"setWindow:");if(setter)setter(app_delegate,"setWindow:",managed,0,0,0);
+        }
+    }
+    const char *callbacks[]={"application:willFinishLaunchingWithOptions:","application:didFinishLaunchingWithOptions:"};
+    for(unsigned i=0;i<COUNT(callbacks);++i){Method callback=find_implementation(app_delegate,callbacks[i]);if(callback){Word result=callback(app_delegate,callbacks[i],application_object,0,0,0);LOG("Application launch callback %s returned %u",callbacks[i],(unsigned)(result&255));}}
+    window_lifecycle_ready=1;platform_notification("UIApplicationDidFinishLaunchingNotification",application_object,0);
+    if(managed && key_window==managed)window_make_visible(managed,"Main storyboard presentation");
+    for(struct ViewState *state=view_states;state;state=state->next)if(!state->hidden && class_inherits(read_word(state->object),external_class("_OBJC_CLASS_$_UIWindow")))window_schedule_presentation(state->object);
+    schedule_main_function(application_activate,NULL);
 }
 
 static void view_host_geometry(Word object,float metrics[11],int options[3]) {
@@ -1031,7 +1081,7 @@ static void view_host_geometry(Word object,float metrics[11],int options[3]) {
 }
 static Method views_method(Word object,const char *selector,const char *receiver,int class_receiver) {
     if (!receiver) return NULL;
-    if(!class_receiver && object==(Word)&application && !strcmp(selector,"windows"))return (Method)application_windows;
+    if(!class_receiver && object==application_object && !strcmp(selector,"windows"))return (Method)application_windows;
     Word cls=class_receiver ? object : read_word(object);
     const char *base=external_base(cls);
     int view=class_inherits(cls,external_class("_OBJC_CLASS_$_UIView")) || (base && !strcmp(base,"_OBJC_CLASS_$__UILayoutGuide"));
@@ -1118,6 +1168,8 @@ static Method views_method(Word object,const char *selector,const char *receiver
         if (!strcmp(selector,"presentedViewController")) return (Method)controller_presented;
         if (!strcmp(selector,"presentingViewController")) return (Method)controller_presenting;
         if (!strcmp(selector,"view")) return (Method)controller_view;
+        if (!strcmp(selector,"loadView")) return (Method)controller_load_view;
+        if (!strcmp(selector,"loadViewIfNeeded")) return (Method)controller_load_if_needed;
         if (!strcmp(selector,"viewIfLoaded")) return (Method)controller_loaded_view;
         if (!strcmp(selector,"setView:")) return (Method)controller_set_view;
         if (!strcmp(selector,"isViewLoaded")) return (Method)controller_loaded;
@@ -1151,6 +1203,11 @@ static Method views_method(Word object,const char *selector,const char *receiver
     if (!strcmp(selector,"setOpaque:")) return (Method)view_set_opaque;
     if (!strcmp(selector,"isOpaque")) return (Method)view_get_opaque;
     if (class_inherits(cls,external_class("_OBJC_CLASS_$_UIWindow"))) {
+        if (!strcmp(selector,"makeKeyAndVisible")) return (Method)window_make_visible;
+        if (!strcmp(selector,"makeKeyWindow")) return (Method)window_make_key;
+        if (!strcmp(selector,"becomeKeyWindow")) return (Method)window_become_key;
+        if (!strcmp(selector,"resignKeyWindow")) return (Method)window_resign_key;
+        if (!strcmp(selector,"isKeyWindow")) return (Method)window_is_key;
         if (!strcmp(selector,"setWindowLevel:")) return (Method)window_set_level;
         if (!strcmp(selector,"windowLevel")) return (Method)window_get_level;
     }

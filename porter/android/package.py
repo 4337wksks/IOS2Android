@@ -8,6 +8,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 from xml.etree import ElementTree as ET
 
+from .. import DirectoryOverlay
 from ..files import build_lock, require_tokens
 from ..build import ROOT, outside
 from .native import run
@@ -115,7 +116,7 @@ def compile_library_resources(context, manifest, resources, libraries, packages,
     run(context, *arguments)
 
 
-def build_host(context, revision, fonts, resources, launch_screen):
+def build_host(context, revision, fonts, resources, launch_screen, adapter=None):
     work = context.work
     shutil.copytree(ROOT / "host/android/res", resources, dirs_exist_ok=True)
     sources, classes, dex = [work / name for name in ("java", "classes", "dex")]
@@ -181,6 +182,9 @@ def build_host(context, revision, fonts, resources, launch_screen):
     ]
     (sources / "BuildProfile.java").write_text("\n".join(profile) + "\n", encoding="utf-8")
     template = (ROOT / "host/android/templates/AndroidManifest.xml").read_text(encoding="utf-8")
+    if any(context.info.get(key) for key in ("NSLocationWhenInUseUsageDescription", "NSLocationAlwaysUsageDescription", "NSLocationAlwaysAndWhenInUseUsageDescription")):
+        permissions = '<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/><uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>'
+        template = template.replace("<queries>", permissions + "<queries>")
     orientations = context.info.get("UISupportedInterfaceOrientations", [])
     default_orientation = (
         "landscape"
@@ -195,6 +199,7 @@ def build_host(context, revision, fonts, resources, launch_screen):
         VERSION_CODE=str(context.version_code),
         VERSION_NAME=f"{context.identity.version} ({context.identity.build})",
         ORIENTATION=orientation,
+        DEBUGGABLE=str(context.development).lower(),
     )
     for name, value in values.items():
         template = template.replace("${" + name + "}", escape(value, {'"': "&quot;"}))
@@ -205,6 +210,7 @@ def build_host(context, revision, fonts, resources, launch_screen):
     manifest = work / "AndroidManifest.xml"
     template, packages = merge_library_manifests(template, libraries, context.application_id)
     manifest.write_text(template, encoding="utf-8")
+    host_options = adapter.host_options(context, sources, manifest) if adapter and hasattr(adapter, "host_options") else {}
     tools = {name: Path(value) for name, value in context.toolchain.items()}
     if libraries:
         compile_library_resources(context, manifest, resources, libraries, packages, sources)
@@ -231,13 +237,14 @@ def build_host(context, revision, fonts, resources, launch_screen):
         "java",
         "-cp",
         tools["sdk"] / "lib/d8.jar",
-        "com.android.tools.r8.D8",
+        "com.android.tools.r8." + host_options.get("compiler", "D8"),
         "--min-api",
         28,
         "--lib",
         tools["platform"],
         "--output",
         dex,
+        *host_options.get("arguments", []),
         host_classes,
         *jars,
     )
@@ -246,13 +253,35 @@ def build_host(context, revision, fonts, resources, launch_screen):
     for token in (b"businessDiagnostics", b"configureShaderDiagnostics"):
         if (token in data) != context.development:
             raise ValueError("DEX diagnostics differ from the build variant")
+    if adapter and hasattr(adapter, "finish_host"):
+        adapter.finish_host(context, dex)
     return manifest, binary
+
+
+def _write_directory_overlay(package, prefix, overlay):
+    for path in sorted(overlay.directory.rglob("*")):
+        if not path.is_file():
+            continue
+        target = prefix + path.relative_to(overlay.directory).as_posix()
+        member = (
+            zipfile.ZipInfo(target, overlay.date_time)
+            if overlay.date_time is not None
+            else zipfile.ZipInfo.from_file(path, target)
+        )
+        member.file_size = path.stat().st_size
+        with path.open("rb") as incoming, package.open(member, "w") as outgoing:
+            shutil.copyfileobj(incoming, outgoing, 1024 * 1024)
 
 
 def build_apk(context, source, manifest, resources, catalog, overlays, native, dex, adapter):
     work, identity = context.work, context.identity
     tools = {name: Path(value) for name, value in context.toolchain.items()}
     assets = work / "assets.apk"
+    directories = {
+        name.rstrip("/") + "/": overlay
+        for name, overlay in overlays.items()
+        if isinstance(overlay, DirectoryOverlay)
+    }
     if not context.host.get("libraries"):
         run(context, tools["sdk"] / "aapt.exe", "package", "-f", "-M", manifest, "-I", tools["platform"], "-S", resources, "-F", assets)
     with zipfile.ZipFile(assets, "a") as package:
@@ -268,6 +297,7 @@ def build_apk(context, source, manifest, resources, catalog, overlays, native, d
                 or member.is_dir()
                 or name == identity.executable
                 or name.startswith(("_CodeSignature/", "SC_Info/"))
+                or any(name.startswith(root) for root in directories)
             ):
                 continue
             target = "assets/" + identity.directory + "/" + name
@@ -276,9 +306,11 @@ def build_apk(context, source, manifest, resources, catalog, overlays, native, d
             else:
                 with source.open(member) as incoming, package.open(target, "w") as outgoing:
                     shutil.copyfileobj(incoming, outgoing, 1024 * 1024)
+        for root, overlay in directories.items():
+            _write_directory_overlay(package, "assets/" + identity.directory + "/" + root, overlay)
         members = set(source.namelist())
         for name, path in catalog:
-            if identity.prefix + name not in members:
+            if identity.prefix + name not in members and not any(name.startswith(root) for root in directories):
                 package.write(
                     path,
                     "assets/" + identity.directory + "/" + name,
@@ -314,6 +346,8 @@ def build_apk(context, source, manifest, resources, catalog, overlays, native, d
             "assets/licenses/Imagination-PVRTC.txt",
             compress_type=zipfile.ZIP_DEFLATED,
         )
+    if adapter and hasattr(adapter, "prepare_package"):
+        adapter.prepare_package(context, unsigned)
     run(context, tools["sdk"] / "zipalign.exe", "-f", 16384, unsigned, "aligned.apk")
     signer = tools["sdk"] / "lib/apksigner.jar"
     sign = context.signing

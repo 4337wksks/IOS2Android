@@ -124,18 +124,22 @@ public final class HostActivity extends Activity {
         final android.graphics.Paint paint=new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG | android.graphics.Paint.FILTER_BITMAP_FLAG);
         final android.graphics.Bitmap[] images; final android.graphics.RectF[] bounds; final double[][][] layout;
         final float[] opacity; final int[] colours,modes,scales; final boolean[] hidden;
+        final android.text.StaticLayout[] labels; final String[] captions; final int[] textColours,alignments,lineCounts;
         LaunchScreenView(Context context) throws org.json.JSONException {
             super(context);
             JSONObject scene=new JSONObject(BuildProfile.LAUNCH_SCREEN); org.json.JSONArray nodes=scene.getJSONArray("views");
             setBackgroundColor(colour(scene.getJSONArray("background")));
             int count=nodes.length(); images=new android.graphics.Bitmap[count]; bounds=new android.graphics.RectF[count]; layout=new double[count][4][3];
             opacity=new float[count]; colours=new int[count]; modes=new int[count]; scales=new int[count]; hidden=new boolean[count];
+            labels=new android.text.StaticLayout[count]; captions=new String[count]; textColours=new int[count]; alignments=new int[count]; lineCounts=new int[count];
             float density=getResources().getDisplayMetrics().density; int preferred=density>2 ? 3 : density>1 ? 2 : 1;
             android.graphics.BitmapFactory.Options decode=new android.graphics.BitmapFactory.Options(); decode.inScaled=false;
             for(int i=0;i<count;i++) {
                 JSONObject node=nodes.getJSONObject(i); int parent=node.getInt("parent"); bounds[i]=new android.graphics.RectF();
                 hidden[i]=node.optBoolean("hidden") || parent>=0 && hidden[parent]; opacity[i]=(float)node.optDouble("alpha",1)*(parent>=0 ? opacity[parent] : 1);
                 colours[i]=node.isNull("background") ? 0 : colour(node.getJSONArray("background")); modes[i]=node.optInt("contentMode");
+                captions[i]=node.optString("text",""); textColours[i]=node.optJSONArray("textColor")==null ? android.graphics.Color.BLACK : colour(node.getJSONArray("textColor"));
+                alignments[i]=node.optInt("alignment"); lineCounts[i]=node.optInt("lines",1);
                 for(int axis=0;axis<4;axis++) for(int value=0;value<3;value++) layout[i][axis][value]=node.getJSONArray("layout").getJSONArray(axis).getDouble(value);
                 org.json.JSONArray candidates=node.getJSONArray("images");
                 for(int desired:new int[]{preferred,preferred==3 ? 2 : 1,preferred==3 ? 1 : 3}) {
@@ -161,6 +165,14 @@ public final class HostActivity extends Activity {
                 float[] values=new float[4];
                 for(int axis=0;axis<4;axis++) values[axis]=(float)(layout[i][axis][0]*width+layout[i][axis][1]*height+layout[i][axis][2]*density);
                 bounds[i].set(values[0],values[1],values[0]+values[2],values[1]+values[3]);
+                labels[i]=null;
+                if(!captions[i].isEmpty() && values[2]>0){
+                    android.text.TextPaint text=new android.text.TextPaint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+                    text.setTextSize(17*density); text.setColor(textColours[i]);
+                    android.text.Layout.Alignment alignment=alignments[i]==1 ? android.text.Layout.Alignment.ALIGN_CENTER : alignments[i]==2 ? android.text.Layout.Alignment.ALIGN_OPPOSITE : android.text.Layout.Alignment.ALIGN_NORMAL;
+                    labels[i]=android.text.StaticLayout.Builder.obtain(captions[i],0,captions[i].length(),text,Math.max(1,Math.round(values[2])))
+                            .setAlignment(alignment).setIncludePad(false).setMaxLines(lineCounts[i]>0 ? lineCounts[i] : Integer.MAX_VALUE).build();
+                }
             }
             if(BuildProfile.DEVELOPMENT) android.util.Log.i("I2AGuest","Original launch layout: "+width+"x"+height);
         }
@@ -170,6 +182,10 @@ public final class HostActivity extends Activity {
                 if(hidden[i] || opacity[i]<=0) continue;
                 android.graphics.RectF box=bounds[i];
                 if(i!=0 && android.graphics.Color.alpha(colours[i])!=0) { paint.setColor(colours[i]); paint.setAlpha(Math.round(opacity[i]*android.graphics.Color.alpha(colours[i]))); canvas.drawRect(box,paint); }
+                if(labels[i]!=null && box.width()>0 && box.height()>0){
+                    labels[i].getPaint().setAlpha(Math.round(opacity[i]*android.graphics.Color.alpha(textColours[i])));
+                    int save=canvas.save(); canvas.clipRect(box); canvas.translate(box.left,box.top+(box.height()-labels[i].getHeight())/2); labels[i].draw(canvas); canvas.restoreToCount(save);
+                }
                 android.graphics.Bitmap bitmap=images[i]; if(bitmap==null || box.width()<=0 || box.height()<=0) continue;
                 android.graphics.RectF target=new android.graphics.RectF(box);
                 if(modes[i]==1 || modes[i]==2 || modes[i]>=4) {
@@ -182,7 +198,7 @@ public final class HostActivity extends Activity {
                 paint.setAlpha(Math.round(opacity[i]*255)); int save=canvas.save(); canvas.clipRect(box); canvas.drawBitmap(bitmap,null,target,paint); canvas.restoreToCount(save);
             }
         }
-        void release() { java.util.Arrays.fill(images,null); }
+        void release() { java.util.Arrays.fill(images,null); java.util.Arrays.fill(labels,null); }
     }
     private MotionSource motion;
     private native String deliverDeviceMotion(long token, int generation, double[] values);
@@ -734,6 +750,19 @@ public final class HostActivity extends Activity {
             guestStatus.setVisibility(android.view.View.GONE);
         });
     }
+    private boolean guestWindowDrawPending;
+    private void guestWindowReady(){
+        mainHandler.post(()->{
+            if(startupFailed || guestLaunch==null || guestWindowDrawPending)return;
+            guestWindowDrawPending=true;
+            android.view.ViewTreeObserver observer=guestContent.getViewTreeObserver();
+            observer.addOnDrawListener(new android.view.ViewTreeObserver.OnDrawListener(){
+                boolean delivered;
+                @Override public void onDraw(){if(delivered)return;delivered=true;guestContent.post(()->{if(observer.isAlive())observer.removeOnDrawListener(this);Log.i("I2AGuest","Guest UIWindow reached its first Android draw");firstFrameRendered();});}
+            });
+            guestContent.invalidate();
+        });
+    }
     private byte[] hmac(String algorithm, byte[] key, byte[] input) throws java.security.GeneralSecurityException {
         javax.crypto.Mac mac = javax.crypto.Mac.getInstance(algorithm);
          
@@ -833,6 +862,7 @@ public final class HostActivity extends Activity {
     @Override public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(request, permissions, results);
         if (photos != null) photos.permissionResult(request, results);
+        if (locations != null) locations.permissionResult(request);
         if (request == NOTIFICATION_PERMISSION) completeNotificationPermissions();
     }
     private CredentialStore keychain;
@@ -1078,6 +1108,7 @@ public final class HostActivity extends Activity {
         if(audioSession!=null) audioSession.close();
         sound.close();
         if (photos != null) photos.close();
+        if (locations != null) { locations.close(); closeLocationSources(); }
         if (shares != null) shares.close();
         if (helpshift != null) helpshift.close();
         super.onDestroy();
@@ -1347,15 +1378,24 @@ public final class HostActivity extends Activity {
         Number number = formatter.parse(text, position);
         return number != null && position.getIndex() == text.length() ? number.toString() : null;
     }
-    private int locationAuthorization() {
-        boolean allowed = checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED ||
-            checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED;
-        return allowed ? 4 : 2;
+    private LocationSource locations;
+    private synchronized LocationSource locationSource(){
+        if(locations==null)locations=new LocationSource(this,mainHandler,operationWorkers,this::deliverLocation,this::deliverLocationAuthorization,this::completeGeocode,this::guestFailure);
+        return locations;
     }
-    private boolean locationEnabled() {
-        android.location.LocationManager manager = (android.location.LocationManager) getSystemService(LOCATION_SERVICE);
-        return manager != null && manager.isLocationEnabled();
-    }
+    private native String deliverLocation(long token,int generation,double[] values,int code,String message);
+    private native String deliverLocationAuthorization(long token,int status);
+    private native String completeGeocode(long token,int generation,String places,int code,String message);
+    private native void closeLocationSources();
+    private int locationAuthorization(){return locationSource().authorization();}
+    private boolean locationEnabled(){return locationSource().enabled();}
+    private void requestLocationAuthorization(long token){locationSource().requestAuthorization(token);}
+    private void startLocation(long token,int generation,double accuracy,double distance,boolean once){locationSource().start(token,generation,accuracy,distance,once);}
+    private void stopLocation(long token){if(locations!=null)locations.stopAsync(token);}
+    private double[] lastLocation(){return locationSource().lastLocation();}
+    private double locationDistance(double firstLatitude,double firstLongitude,double latitude,double longitude){float[] distance=new float[1];android.location.Location.distanceBetween(firstLatitude,firstLongitude,latitude,longitude,distance);return distance[0];}
+    private void geocode(long token,int generation,String address,double latitude,double longitude,double[] bounds,String language){locationSource().geocode(token,generation,address,latitude,longitude,bounds,language);}
+    private void cancelGeocode(long token){if(locations!=null)locations.cancelGeocode(token);}
     private String[] telephonyInfo() {
         android.telephony.TelephonyManager phone = (android.telephony.TelephonyManager) getSystemService(TELEPHONY_SERVICE);
         if (phone == null || phone.getSimState() != android.telephony.TelephonyManager.SIM_STATE_READY) return null;
@@ -1566,6 +1606,7 @@ public final class HostActivity extends Activity {
                 try {
                     Files.copy(input, temp.toPath(), StandardCopyOption.REPLACE_EXISTING);
                     Files.move(temp.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                    Log.i("I2AGuest","Bundle file materialized: "+relative+" ("+target.length()+" bytes)");
                 } finally {
                     temp.delete();
                 }
@@ -1576,10 +1617,12 @@ public final class HostActivity extends Activity {
         return target.getPath();
     }
     private static void removeCacheTree(File directory) throws IOException {
+        long[] removed={0};
         Files.walkFileTree(directory.toPath(),new java.nio.file.SimpleFileVisitor<java.nio.file.Path>() {
-            @Override public java.nio.file.FileVisitResult visitFile(java.nio.file.Path file,java.nio.file.attribute.BasicFileAttributes attributes) throws IOException {Files.deleteIfExists(file);return java.nio.file.FileVisitResult.CONTINUE;}
+            @Override public java.nio.file.FileVisitResult visitFile(java.nio.file.Path file,java.nio.file.attribute.BasicFileAttributes attributes) throws IOException {if(Files.deleteIfExists(file))removed[0]+=attributes.size();return java.nio.file.FileVisitResult.CONTINUE;}
             @Override public java.nio.file.FileVisitResult postVisitDirectory(java.nio.file.Path path,IOException failure) throws IOException {if(failure!=null)throw failure;Files.deleteIfExists(path);return java.nio.file.FileVisitResult.CONTINUE;}
         });
+        Log.i("I2AGuest","Obsolete runtime cache removed: "+directory.getName()+" ("+removed[0]+" bytes)");
     }
     private static void pruneCacheVersions(File root,String current) {
         File[] children=root.listFiles();if(children==null)return;
@@ -1587,7 +1630,7 @@ public final class HostActivity extends Activity {
     }
     private void cleanRuntimeCaches() {
         operationWorkers.execute(()-> {
-            File[] legacy=getCacheDir().listFiles();if(legacy!=null)for(File child:legacy)if(child.getName().matches("bundle-[0-9a-f]{12}"))try{removeCacheTree(child);}catch(IOException failure){Log.w("I2AGuest","Unable to remove obsolete bundle cache",failure);}
+            File[] legacy=getCacheDir().listFiles();if(legacy!=null)for(File child:legacy)if(child.getName().matches("bundle-(?:[0-9a-f]{12}|.+-[0-9a-f]{20})"))try{removeCacheTree(child);}catch(IOException failure){Log.w("I2AGuest","Unable to remove obsolete bundle cache",failure);}
             pruneCacheVersions(new File(getCacheDir(),"bundle-files"),BuildProfile.PACKAGE_REVISION);
             pruneCacheVersions(new File(getCodeCacheDir(),"vulkan"),BuildProfile.PACKAGE_REVISION);
         });
@@ -1620,6 +1663,42 @@ public final class HostActivity extends Activity {
         } catch (IOException missing) {
             return false;
         }
+    }
+
+    private final ConcurrentHashMap<String,String[]> bundleResourceLanguages=new ConcurrentHashMap<>();
+    private static int resourceLanguageScore(String supported,Locale wanted) {
+        android.icu.util.ULocale expected=android.icu.util.ULocale.addLikelySubtags(android.icu.util.ULocale.forLocale(wanted));
+        android.icu.util.ULocale actual=android.icu.util.ULocale.addLikelySubtags(android.icu.util.ULocale.forLanguageTag(supported.replace('_','-')));
+        if(supported.equalsIgnoreCase(wanted.getDisplayLanguage(Locale.ENGLISH)))return 1;
+        if(!expected.getLanguage().equals(actual.getLanguage()) || !expected.getScript().equals(actual.getScript()))return -1;
+        return supported.equalsIgnoreCase(wanted.toLanguageTag()) ? 100 : expected.getCountry().equals(actual.getCountry()) ? 10 : 1;
+    }
+    private String localizedBundleResource(String root,String filename,String development) throws IOException {
+        boolean assets=root.equals(BuildProfile.BUNDLE_NAME) || root.startsWith(BuildProfile.BUNDLE_NAME+"/");
+        if(!assets && !new File(root).isAbsolute())return null;
+        if(filename.startsWith("/") || filename.contains(".lproj/") || Arrays.asList(filename.split("/")).contains("..") || Arrays.asList(root.split("/")).contains(".."))return null;
+        android.os.LocaleList preferred=getResources().getConfiguration().getLocales();
+        String key=root+"|"+preferred.toLanguageTags()+"|"+development;
+        String[] ordered=bundleResourceLanguages.get(key);
+        if(ordered==null){
+            ArrayList<String> available=new ArrayList<>(),selected=new ArrayList<>();
+            String[] folders=assets ? getAssets().list(root) : new File(root).list();
+            if(folders!=null)for(String folder:folders)if(folder.endsWith(".lproj") && !folder.equals("Base.lproj"))available.add(folder);
+            java.util.Collections.sort(available);
+            for(int i=0;i<preferred.size();i++){
+                Locale wanted=preferred.get(i);ArrayList<String> matches=new ArrayList<>();
+                for(String folder:available)if(resourceLanguageScore(folder.substring(0,folder.length()-6),wanted)>=0)matches.add(folder);
+                matches.sort((a,b)->Integer.compare(resourceLanguageScore(b.substring(0,b.length()-6),wanted),resourceLanguageScore(a.substring(0,a.length()-6),wanted)));
+                for(String folder:matches)if(!selected.contains(folder))selected.add(folder);
+            }
+            if(development!=null && !development.isEmpty()){
+                String folder=development+".lproj";if(!selected.contains(folder))selected.add(folder);
+            }
+            if(!selected.contains("Base.lproj"))selected.add("Base.lproj");
+            ordered=selected.toArray(new String[0]);String[] prior=bundleResourceLanguages.putIfAbsent(key,ordered);if(prior!=null)ordered=prior;
+        }
+        for(String folder:ordered){String path=root+"/"+folder+"/"+filename;if(!assets){if(new File(path).isFile())return path;continue;}try(InputStream ignored=getAssets().open(path)){return path;}catch(java.io.FileNotFoundException missing){}}
+        return null;
     }
 
     private int bundleEntryType(String relative) {

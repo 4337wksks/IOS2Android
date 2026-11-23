@@ -6,11 +6,7 @@ from nibarchive import NIBArchiveParser
 
 
 def controller_catalogue(source, prefix):
-    """Read controller identities once at build time; never substitute a class.
-
-    This is scene/containment metadata, not a claim that arbitrary archived view
-    graphs have an Android presenter. The original NIB bytes stay in the APK.
-    """
+    """Recover archived controller identities and supported view graphs."""
     catalogue = {}
     members = set(source.namelist())
     for path in sorted(members):
@@ -54,6 +50,11 @@ def controller_catalogue(source, prefix):
                 if bar_class != 'UINavigationBar':
                     raise ValueError(f'Unrepresented navigation bar in {path}: {identifier}')
                 scene['barStyle'] = bar.get('UIBarStyle', 0)
+            try:
+                _, _, graph = archived_scene(source, folder, name)
+                scene['viewGraph'] = json.dumps(graph, separators=(',', ':'))
+            except (KeyError, ValueError):
+                pass
             scenes[identifier] = scene
         catalogue[folder[len(prefix):].rstrip('/')] = scenes
     return catalogue
@@ -62,21 +63,33 @@ def controller_catalogue(source, prefix):
 def prepare_controller_catalogue(source, prefix, work):
     catalogue = controller_catalogue(source, prefix)
     encoded = json.dumps(catalogue, sort_keys=True, separators=(',', ':'))
-    launch = plistlib.loads(source.read(prefix + 'Info.plist'))['UIMainStoryboardFile']
     (work / 'storyboard_catalogue.h').write_text(
-        '#ifndef GUEST_LAUNCH_STORYBOARD\n#define GUEST_LAUNCH_STORYBOARD ' + json.dumps(launch) + '\n#endif\n' +
         'static const char storyboard_catalogue_json[] = ' + json.dumps(encoded) + ';\n', encoding='utf-8')
     (work / 'storyboard-catalogue.json').write_text(json.dumps(catalogue, indent=2) + '\n', encoding='utf-8')
 
 
 def launch_scene(source, prefix, board):
-    folder = f'{prefix}Base.lproj/{board}.storyboardc/'
+    members = set(source.namelist())
+    candidates = [prefix + board + '.storyboardc/', prefix + 'Base.lproj/' + board + '.storyboardc/']
+    development = plistlib.loads(source.read(prefix + 'Info.plist')).get('CFBundleDevelopmentRegion')
+    if development:
+        candidates.append(prefix + development + '.lproj/' + board + '.storyboardc/')
+    candidates += sorted(path.rsplit('/', 1)[0] + '/' for path in members if path.startswith(prefix) and path.endswith('/' + board + '.storyboardc/Info.plist'))
+    folder = next((path for path in candidates if path + 'Info.plist' in members), None)
+    if folder is None:
+        raise ValueError('Storyboard resource was not found: ' + board)
     metadata = plistlib.loads(source.read(folder+'Info.plist'))
     entry = metadata['UIStoryboardDesignatedEntryPointIdentifier']
     filename = metadata['UIViewControllerIdentifiersToNibNames'][entry]
+    return archived_scene(source, folder, filename)
+
+
+def archived_scene(source, folder, filename):
 
     def load(name):
-        archive = NIBArchiveParser().parse(io.BytesIO(source.read(folder+name+'.nib')))
+        path=folder+name+'.nib'
+        if path not in source.namelist():path+='/runtime.nib'
+        archive = NIBArchiveParser().parse(io.BytesIO(source.read(path)))
         objects = []
         for obj in archive.objects:
             fields = list(archive.get_object_values(obj))
@@ -99,11 +112,11 @@ def launch_scene(source, prefix, board):
 
     objects = load(filename)
     cls, values = outlet(objects, 'sceneViewController')
-    if cls not in ('UIClassSwapper', 'UIViewController'):
+    if cls != 'UIClassSwapper' and not cls.endswith('Controller'):
         raise ValueError(f'Unsupported scene controller {cls}')
     controller_class = cls
-    view_objects = load(string(objects, values['UINibName']))
-    view_class, root = outlet(view_objects, 'view')
+    view_objects = load(string(objects, values['UINibName'])) if 'UINibName' in values else objects
+    view_class, root = outlet(view_objects, 'view') if 'UIView' not in values or view_objects is not objects else view_objects[values['UIView']]
     root_index = next(index for index, (_, value) in enumerate(view_objects) if value is root)
     nodes, mapping, constraints = [], {}, []
 
@@ -123,7 +136,9 @@ def launch_scene(source, prefix, board):
 
     def visit(index, parent):
         cls, fields = view_objects[index]
-        if cls not in ('UIView', 'UIImageView', '_UILayoutGuide'):
+        actual=string(view_objects,fields['UIClassName']) if cls=='UIClassSwapper' else cls
+        base=string(view_objects,fields['UIOriginalClassName']) if cls=='UIClassSwapper' else cls
+        if base not in ('UIView', 'UIImageView', 'UILabel', '_UILayoutGuide'):
             raise ValueError(f'Unsupported startup view class {cls}')
         local = len(nodes)
         mapping[index] = local
@@ -135,12 +150,17 @@ def launch_scene(source, prefix, board):
             if image_cls != 'UIImageNibPlaceholder':
                 raise ValueError(f'Unsupported startup image {image_cls}')
             image = string(view_objects, image_values['UIResourceName'])
-        nodes.append({'class': cls, 'parent': parent, 'tag': fields.get('UITag', 0),
+        nodes.append({'class': actual, 'base': base, 'parent': parent, 'tag': fields.get('UITag', 0),
                       'hidden': fields.get('UIHidden', False), 'alpha': fields.get('UIAlpha', 1),
                       'contentMode': fields.get('UIContentMode', 0), 'autoresizing': fields.get('UIAutoresizingMask', 0),
                       'interaction': not fields.get('UIUserInteractionDisabled', False), 'image': image,
                       'background': colour(fields.get('UIBackgroundColor')),
                       'frame': [center[0] - bounds[2] / 2, center[1] - bounds[3] / 2, bounds[2], bounds[3]]})
+        if base=='UILabel':
+            nodes[-1]['text']=string(view_objects,fields['UIText']) if 'UIText' in fields else ''
+            nodes[-1]['textColor']=colour(fields.get('UITextColor'))
+            nodes[-1]['alignment']=fields.get('UITextAlignment',0)
+            nodes[-1]['lines']=fields.get('UINumberOfLines',1)
         for child in view_objects[fields['UISubviews']][1]['_items'] if 'UISubviews' in fields else []:
             visit(child, local)
 
@@ -158,12 +178,10 @@ def launch_scene(source, prefix, board):
                             'multiplier': fields.get('NSMultiplier', 1),
                             'constant': fields.get('NSConstantV2', fields.get('NSConstant', 0)),
                             'relation': fields.get('NSRelation', 0), 'priority': fields.get('NSPriority', 1000)})
-    return string(objects, values['UIClassName']) if controller_class == 'UIClassSwapper' else controller_class, view_class, {'views': nodes, 'constraints': constraints}
+    return string(objects, values['UIClassName']) if controller_class == 'UIClassSwapper' else controller_class, nodes[0]['class'], {'views': nodes, 'constraints': constraints}
 
 
 def scene_layout(scene):
-    if any(view['parent'] > 0 for view in scene['views']):
-        raise ValueError('Unsupported nested launch view layout')
     count = len(scene['views']) * 4
     basis = [None] * count
 
@@ -189,6 +207,16 @@ def scene_layout(scene):
             raise ValueError('Unsupported launch constraint attribute')
         for index, value in enumerate(terms[kind]):
             row[item * 4 + index] += factor * value
+        axis = 0 if kind in (1, 2, 5, 6, 9) else 1 if kind in (3, 4, 10) else None
+        if axis is not None:
+            for _ in range(len(scene['views'])):
+                parent = scene['views'][item]['parent']
+                if parent < 0:
+                    break
+                if parent >= item:
+                    raise ValueError('Invalid archived view hierarchy')
+                row[parent * 4 + axis] += factor
+                item = parent
 
     for index in range(4):
         row = [0.] * (count + 3)
@@ -214,7 +242,15 @@ def scene_layout(scene):
     for index in reversed(range(count)):
         row = basis[index]
         values[index] = [row[count + axis] - sum(row[j] * values[j][axis] for j in range(index + 1, count)) for axis in range(3)]
-    return [values[index:index + 4] for index in range(0, count, 4)]
+    frames = [values[index:index + 4] for index in range(0, count, 4)]
+    for index, view in enumerate(scene['views']):
+        parent = view['parent']
+        if parent >= 0:
+            if parent >= index:
+                raise ValueError('Invalid archived view hierarchy')
+            for axis in (0, 1):
+                frames[index][axis] = [value + ancestor for value, ancestor in zip(frames[index][axis], frames[parent][axis])]
+    return frames
 
 
 def prepare_launch_screen(source, prefix, info, resources, catalog):
@@ -238,9 +274,12 @@ def prepare_launch_screen(source, prefix, info, resources, catalog):
                     raw = source.read(prefix + asset) if prefix + asset in members else converted[asset].read_bytes() if asset in converted else None
                     if raw is None:
                         continue
-                    normalized, _ = normalize_png(raw)
+                    extension = suffix.lower()
+                    normalized = normalize_png(raw)[0] if extension == '.png' else raw
+                    if extension not in ('.png', '.jpg', '.jpeg', '.webp', '.gif'):
+                        raise ValueError('Unsupported launch image format: ' + suffix)
                     resource = f'launch_image_{index}_{scale}'
-                    (resources / 'drawable-nodpi' / (resource + '.png')).write_bytes(normalized)
+                    (resources / 'drawable-nodpi' / (resource + extension)).write_bytes(normalized)
                     node['images'].append({'resource': resource, 'scale': scale})
                 if not node['images']:
                     raise ValueError('Missing original launch image: ' + name)

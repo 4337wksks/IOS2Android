@@ -122,14 +122,20 @@ static const char *const extra_class_names[]={
     , "_OBJC_CLASS_$_UIWebView", "_OBJC_CLASS_$_WKWebView", "_OBJC_CLASS_$_WKWebViewConfiguration", "_OBJC_CLASS_$_WKPreferences"
     , "_OBJC_CLASS_$_WKUserContentController", "_OBJC_CLASS_$_WKUserScript", "_OBJC_CLASS_$_WKNavigation", "_OBJC_CLASS_$_WKNavigationAction", "_OBJC_CLASS_$_WKFrameInfo"
     , "_OBJC_CLASS_$_UIScrollView", "_OBJC_CLASS_$_UITextView"
+    , "_OBJC_CLASS_$_CLLocation", "_OBJC_CLASS_$_CLLocationManager", "_OBJC_CLASS_$_CLLocationSourceInformation", "_OBJC_CLASS_$_CLGeocoder", "_OBJC_CLASS_$_CLPlacemark"
+    , "_OBJC_CLASS_$_CNPostalAddress", "_OBJC_CLASS_$_CNMutablePostalAddress"
 };
 static Word extra_class_objects[COUNT(extra_class_names)][4];
 static void initialize_guest_class(Word cls);
 static void construct_guest_ivars(Word object,Word cls);
-static void load_application_view(void);
-static void finish_application_lifecycle(void);
+static void ui_application_start(Word,Word);
+static Word controller_view(Word);
+static Word window_controller(Word);
 static void run_interface_preflight(void);
 static Method views_method(Word,const char *,const char *,int);
+static Method foundation_method(Word,const char *,const char *,int);
+static Method framework_implementation(Word,const char *,const char *,int);
+static Word object_superclass(Word);
 static Word aslr, global_guard;
 static int started;
 static int application_ready;
@@ -400,11 +406,13 @@ static pthread_mutex_t observers_mutex=PTHREAD_MUTEX_INITIALIZER;
 static struct HostObject center, bundle;
 static Word bundle_dictionary;
 static struct HostObject process_info, arguments_array, defaults;
-static struct HostObject main_thread, application, main_window, root_view;
+static struct HostObject main_thread, application, main_window;
+static Word application_object=(Word)&application;
 static struct HostObject file_manager;
 static struct HostObject bool_numbers[2];
 static struct HostObject null_value;
 static Word root_controller, app_delegate;
+static Word key_window;
 static _Thread_local Word active_pool;
 struct MetalAutoreleasePool {
     Word parent,*objects;
@@ -531,7 +539,7 @@ static int asl_add_fd(struct AslClient *client,int fd) {
 
 __attribute__((used,noinline)) static int asl_emit(struct AslClient *client,Word message,unsigned level,const char *format,const char *const *args) {
     if (!client || level>7) return -1;
-    if (!I2A_DEVELOPMENT && level>3) return 0;
+    if (!I2A_DEVELOPMENT) return 0;
     if (!(client->mask & (1U<<level))) return 0;
     const char *text=format;
     if (!strcmp(format,"%s")) text=args[0];
@@ -575,6 +583,7 @@ static void host_class_index_init(void) {
         {"CAMetalLayer","CALayer"},{"CAGradientLayer","CALayer"},{"CAShapeLayer","CALayer"},{"CAEAGLLayer","CALayer"},
         {"NSDecimalNumber","NSNumber"},{"NSNumber","NSValue"},{"NSDirectoryEnumerator","NSEnumerator"},{"NSInvocationOperation","NSOperation"},{"NSBlockOperation","NSOperation"},{"SKMutablePayment","SKPayment"},
         {"NSDateFormatter","NSFormatter"},{"NSNumberFormatter","NSFormatter"},{"NSHTTPURLResponse","NSURLResponse"},
+        {"CNMutablePostalAddress","CNPostalAddress"},
         {"NSURLSessionDataTask","NSURLSessionTask"},{"NSURLSessionDownloadTask","NSURLSessionTask"},{"NSURLSessionUploadTask","NSURLSessionDataTask"}
     };
     _Static_assert(COUNT(symbols)+COUNT(extra_class_names)<COUNT(host_class_index),"Host symbol index capacity");
@@ -663,35 +672,7 @@ static Word guest_object(Word cls) {
 }
 
 static Word application_main(int argc,char **argv,Word principal,Word delegate_name) {
-    if (principal || !delegate_name) stop("Unsupported application principal","UIApplicationMain");
-    Word delegate_class=class_from_string(delegate_name);
-    app_delegate=guest_object(delegate_class);
-    application.isa=external_class("_OBJC_CLASS_$_UIApplication");
-    main_window.isa=external_class("_OBJC_CLASS_$_UIWindow");
-    char view_class[160];
-    snprintf(view_class,sizeof(view_class),"_OBJC_CLASS_$_%s",ROOT_VIEW);
-    root_view.isa=external_class(view_class);
-    Word *classes=(Word *)(aslr+CLASSES_OFFSET);
-    for (unsigned index=0;index<CLASSES_COUNT;++index) {
-        if (!strcmp(class_name(classes[index]),ROOT_CONTROLLER)) {
-            root_controller=guest_object(classes[index]);
-            break;
-        }
-    }
-    if (!root_controller) stop("Missing storyboard controller",ROOT_CONTROLLER);
-    Method window_setter=lookup(delegate_class,"setWindow:");
-    Method launch=lookup(delegate_class,"application:didFinishLaunchingWithOptions:");
-    if (!window_setter || !launch) stop("Missing application delegate method",class_name(delegate_class));
-    LOG("UIKit main storyboard root=%s view=%s delegate=%s",ROOT_CONTROLLER,ROOT_VIEW,class_name(delegate_class));
-    snprintf(stage,sizeof(stage),"AppDelegate setWindow:");
-    window_setter(app_delegate,"setWindow:",(Word)&main_window,0,0,0);
-    snprintf(stage,sizeof(stage),"AppDelegate didFinishLaunchingWithOptions: 0x%lx",(Word)launch-aslr+GUEST_IMAGE_BASE);
-    LOG("%s",stage);
-    Word launched=launch(app_delegate,"application:didFinishLaunchingWithOptions:",(Word)&application,0,0,0);
-    if (!(launched&255)) stop("Application delegate declined launch",ROOT_CONTROLLER);
-    LOG("Original AppDelegate launch returned YES");
-    load_application_view();
-    finish_application_lifecycle();
+    ui_application_start(principal,delegate_name);
     application_ready=1;
     run_interface_preflight();
     LOG("Original UIKit startup complete; Android Looper owns continuation");
@@ -699,11 +680,11 @@ static Word application_main(int argc,char **argv,Word principal,Word delegate_n
     longjmp(boundary,2);
 }
 
-static Word shared_app(void) { return (Word)&application; }
+static Word shared_app(void) { if(!application.isa)application.isa=external_class("_OBJC_CLASS_$_UIApplication");return application_object; }
 static Word get_delegate(void) { return app_delegate; }
-static Word get_window(void) { return (Word)&main_window; }
-static Word get_root(void) { return root_controller; }
-static Word get_view(void) { return (Word)&root_view; }
+static Word get_window(void) { return key_window; }
+static Word get_root(void) { return key_window ? window_controller(key_window) : 0; }
+static void set_delegate(Word object,const char *selector,Word delegate) { app_delegate=delegate; }
 static void store_strong(Word *slot,Word value) {
     Word previous=*slot;
     if (previous==value) return;
@@ -1362,14 +1343,30 @@ static Word class_of(Word object) { return read_word(object); }
 
 __attribute__((used,noinline)) static Method super_lookup(const Word *pair,const char *selector) {
     Word start=pair[1];
-    if (!in_image(start)) stop("Unsupported superclass",selector);
+    if (!in_image(start) && !dynamic_class(start) && !host_symbol(start)) stop("Unsupported superclass",selector);
     Word parent=read_word(start+8);
     Method result=lookup(parent,selector);
     if (result) return result;
-    result=operations_method(pair[0],selector,class_name(parent),guest_class_object(pair[0]));
+    int class_receiver=guest_class_object(pair[0]) || host_symbol(pair[0])!=NULL;
+    const char *receiver=class_name(parent);
+    char class_symbol[256];
+    if(receiver && !strncmp(receiver,"_OBJC_METACLASS_$_",sizeof("_OBJC_METACLASS_$_")-1)){
+        snprintf(class_symbol,sizeof(class_symbol),"_OBJC_CLASS_$_%s",receiver+sizeof("_OBJC_METACLASS_$_")-1);receiver=class_symbol;
+    }
+    Word parent_class=class_receiver ? (receiver ? class_from_name(receiver) : 0) : parent;
+    struct HostObject prototype={.isa=parent_class};
+    const char *base=parent_class ? external_base(parent_class) : NULL;
+    result=parent_class ? framework_implementation(class_receiver ? parent_class : (Word)&prototype,selector,base ? base : receiver,class_receiver) : NULL;
     if (result) return result;
-    result=views_method(pair[0],selector,class_name(parent),guest_class_object(pair[0]));
-    if (result) return result;
+    if(!class_receiver && pair[0]==application_object){
+        if(!strcmp(selector,"delegate"))return (Method)get_delegate;
+        if(!strcmp(selector,"setDelegate:"))return (Method)set_delegate;
+        if(!strcmp(selector,"keyWindow"))return (Method)get_window;
+        result=framework_implementation(pair[0],selector,base ? base : receiver,0);if(result)return result;
+    }
+    if (!strcmp(selector,"class")) return class_receiver ? (Method)identity : (Method)class_of;
+    if (!strcmp(selector,"superclass")) return (Method)object_superclass;
+    if (!class_receiver && !strcmp(selector,"isKindOfClass:")) return (Method)is_kind_of;
     if (guest_class_object(pair[0]) && (!strcmp(selector,"allocWithZone:") || !strcmp(selector,"alloc"))) return (Method)guest_object;
     if (parent && !strcmp(selector,"init")) return (Method)identity;
     stop("Unimplemented superclass method",selector);
@@ -1395,13 +1392,15 @@ static Word format_argument(const unsigned char **arguments,size_t size) {
 
 static void print_object(FILE *stream,Word object) {
     if (!object) { fputs("(null)",stream); return; }
-    Word cls=host_symbol(object) || guest_class_object(object) ? object : read_word(object);
+    int class_receiver=host_symbol(object)!=NULL || guest_class_object(object);
+    Word cls=class_receiver ? object : read_word(object);
+    const char *name=class_name(cls);
+    const char *display=name && !strncmp(name,"_OBJC_CLASS_$_",14) ? name+14 : name;
+    if (class_receiver) { fputs(display ? display : "NSObject",stream); return; }
     if (cls==external_class("_OBJC_CLASS_$_NSString") || cls==external_class("_OBJC_CLASS_$_NSMutableString")) {
         fputs(string_bytes(object,"description"),stream);
         return;
     }
-    const char *name=class_name(cls);
-    if (guest_class_object(object) || host_symbol(object)) { fputs(name ? name : "NSObject",stream); return; }
     if (cls==decimal_number_class) {
         char text[192]; decimal_format(decimal_load((void *)object),text); fputs(text,stream);
     }
@@ -1410,7 +1409,7 @@ static void print_object(FILE *stream,Word object) {
         if (number->content[1]) fprintf(stream,"%.17g",numeric_double(number));
         else fprintf(stream,"%lld",(long long)number->content[0]);
     }
-    else fprintf(stream,"<%s: 0x%lx>",name ? name : "NSObject",object);
+    else fprintf(stream,"<%s: 0x%lx>",display ? display : "NSObject",object);
 }
 
 #include "../frameworks/foundation/foundation_format.inc"
@@ -1504,6 +1503,8 @@ static void *io_mmap(void *,size_t,int,int,int,off_t);
 static int io_dup(int);
 static int io_dup2(int,int);
 static int bundle_fd_duplicate(int,int);
+static Word bundle_data(Word,const char *);
+static Word string_from_java(JNIEnv *,jstring,const char *);
 static AAssetManager *bundle_assets;
 static jobject bundle_assets_owner;
 static struct stat bundle_archive_info;
@@ -1602,22 +1603,8 @@ static const char *bundle_relative(const char *path) {
 #include "objc/layout.inc"
 #include "../frameworks/helpshift.inc"
 
-static Method find_implementation_uncached(Word object, const char *selector) {
-    if (!object) return NULL;
-    const char *external = host_symbol(object);
-    Method found = external ? lookup_external_class_method(object,selector) : lookup(read_word(object), selector);
-    if (found && runtime_extension.wrap_method) found=runtime_extension.wrap_method(found);
-    if (found) return found;
-    if (!strcmp(selector,"superclass")) return (Method)object_superclass;
-    if (!external && !strcmp(selector,"isKindOfClass:")) return (Method)is_kind_of;
-    int class_receiver=external!=NULL || guest_class_object(object);
-    if (!strcmp(selector,"class")) return class_receiver ? (Method)identity : (Method)class_of;
-    if ((!strcmp(selector,"alloc") || !strcmp(selector,"allocWithZone:")) && !external && class_receiver) return (Method)guest_object;
-    if (!class_receiver && !strcmp(selector,"init")) {
-        const char *base=external_base(read_word(object));
-        if (base && !strcmp(base,"_OBJC_CLASS_$_NSObject")) return (Method)identity;
-    }
-    const char *receiver = external ? external : class_name(class_receiver ? object : read_word(object));
+static Method framework_implementation(Word object,const char *selector,const char *receiver,int class_receiver) {
+    Method found;
     found=invocation_method(object,selector,receiver,class_receiver);
     if (found) return found;
     found=net_service_method(object,selector,receiver,class_receiver);
@@ -1732,6 +1719,27 @@ static Method find_implementation_uncached(Word object, const char *selector) {
     if (found) return found;
     found=foundation_method(object,selector,receiver,class_receiver);
     if (found) return found;
+    return NULL;
+}
+
+static Method find_implementation_uncached(Word object, const char *selector) {
+    if (!object) return NULL;
+    const char *external = host_symbol(object);
+    Method found = external ? lookup_external_class_method(object,selector) : lookup(read_word(object), selector);
+    if (found && runtime_extension.wrap_method) found=runtime_extension.wrap_method(found);
+    if (found) return found;
+    if (!strcmp(selector,"superclass")) return (Method)object_superclass;
+    if (!external && !strcmp(selector,"isKindOfClass:")) return (Method)is_kind_of;
+    int class_receiver=external!=NULL || guest_class_object(object);
+    if (!strcmp(selector,"class")) return class_receiver ? (Method)identity : (Method)class_of;
+    if ((!strcmp(selector,"alloc") || !strcmp(selector,"allocWithZone:")) && !external && class_receiver) return (Method)guest_object;
+    if (!class_receiver && !strcmp(selector,"init")) {
+        const char *base=external_base(read_word(object));
+        if (base && !strcmp(base,"_OBJC_CLASS_$_NSObject")) return (Method)identity;
+    }
+    const char *receiver = external ? external : class_name(class_receiver ? object : read_word(object));
+    found=framework_implementation(object,selector,receiver,class_receiver);
+    if (found) return found;
     if (receiver && !strcmp(receiver,"_OBJC_CLASS_$_NSArray")) {
         if (external && !strcmp(selector,"arrayWithObjects:count:")) return (Method)new_array;
         if (!external && object!=(Word)&arguments_array) {
@@ -1782,10 +1790,9 @@ static Method find_implementation_uncached(Word object, const char *selector) {
         if (!external && !strcmp(selector,"bytes")) return (Method)data_buffer;
     }
     if (external && !strcmp(external,"_OBJC_CLASS_$_UIApplication") && !strcmp(selector,"sharedApplication")) return (Method)shared_app;
-    if (object==(Word)&application && !strcmp(selector,"delegate")) return (Method)get_delegate;
-    if (object==(Word)&application && !strcmp(selector,"keyWindow")) return (Method)get_window;
-    if (object==(Word)&main_window && !strcmp(selector,"rootViewController")) return (Method)get_root;
-    if (object==root_controller && !strcmp(selector,"view")) return (Method)get_view;
+    if (object==application_object && !strcmp(selector,"delegate")) return (Method)get_delegate;
+    if (object==application_object && !strcmp(selector,"setDelegate:")) return (Method)set_delegate;
+    if (object==application_object && !strcmp(selector,"keyWindow")) return (Method)get_window;
     if (external && !strcmp(external,"_OBJC_CLASS_$_NSThread") && !strcmp(selector,"mainThread")) return (Method)get_main_thread;
     if (object==(Word)&main_thread && !strcmp(selector,"setName:")) return (Method)set_thread_name;
     if (external && !strcmp(external,"_OBJC_CLASS_$_NSUserDefaults") && !strcmp(selector,"standardUserDefaults")) return (Method)standard_defaults;
