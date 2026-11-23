@@ -1,8 +1,8 @@
 import importlib.util
+import hashlib
 import json
 import re
 import sys
-import uuid
 import zipfile
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -209,6 +209,7 @@ def bundle_header(context, source, controller, view, scene):
         "#define STOREKIT_EMPTY_CATALOGUE " + str(int(catalogue == "empty")),
         "#define HELPSHIFT_NATIVE_BACKEND " + str(int(native_support)),
         "#define GUEST_APP_BUILD " + str(context.version_code),
+        "#define BUNDLE_STREAMING " + str(int(bool(context.host.get("bundle_streaming", False)))),
         "static const char storyboard_scene[] = "
         + json.dumps(json.dumps(scene, separators=(",", ":")))
         + ";",
@@ -243,6 +244,19 @@ def interface_catalogue(context):
         "static const struct InterfaceProbe interface_probes[]={\n" + ",\n".join(rows) + "\n};\n",
         encoding="utf-8",
     )
+
+
+def bundle_revision(context, catalog, overlays):
+    with context.ipa.open("rb") as source:
+        digest = hashlib.file_digest(source, "sha256")
+    digest.update((context.work / "guest.bin").read_bytes())
+    for kind, additions in ((b"overlays", overlays.items()),
+                            (b"catalog", ((name, Path(path).read_bytes()) for name, path in catalog))):
+        digest.update(kind + b"\0")
+        for name, content in sorted(additions):
+            digest.update(name.encode("utf-8") + b"\0")
+            digest.update(hashlib.sha256(content).digest())
+    return digest.hexdigest()[:12]
 
 
 def build(context, core_only=False):
@@ -300,7 +314,7 @@ def build(context, core_only=False):
                     or context.identity.prefix + name not in source.namelist()
                 ):
                     raise ValueError("Overlay must target an existing bundle resource: " + name)
-            revision = uuid.uuid4().hex[:12]
+            revision = bundle_revision(context, catalog, overlays)
             event("shaders")
             if adapter:
                 plan = adapter.shader_plan(context, source)

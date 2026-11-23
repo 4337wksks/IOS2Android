@@ -4,6 +4,8 @@
 #endif
 #include <android/log.h>
 #include <android/looper.h>
+#include <android/asset_manager.h>
+#include <android/asset_manager_jni.h>
 #include <jni.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -151,6 +153,8 @@ static void render_diagnostic_cost(unsigned kind,uint64_t begin) {
 static _Thread_local int may_unwind;
 static JavaVM *java_vm;
 static jobject activity;
+static jobject bundle_assets;
+static AAssetManager *bundle_asset_manager;
 static jmethodID preference_method, bundle_file_method, digest_method;
 static jmethodID certificate_method, trust_method;
 static jmethodID system_text_method;
@@ -1485,6 +1489,8 @@ static const char *bundle_relative(const char *path) {
     if (!path[length]) return path+length;
     return path[length]=='/' ? path+length+1 : NULL;
 }
+static char *native_path(const char *);
+#include "darwin/bundle_stream.inc"
 #include "../frameworks/foundation/foundation.inc"
 #include "../frameworks/network/security.inc"
 #include "../frameworks/network/secure_transport.inc"
@@ -2459,6 +2465,15 @@ JNIEXPORT jstring JNICALL HOST_JNI(HostActivity_startGuest)(JNIEnv *env,jobject 
         may_unwind=1;
         (*env)->GetJavaVM(env,&java_vm);
         activity=(*env)->NewGlobalRef(env,instance);
+        jclass host_class=(*env)->GetObjectClass(env,instance);
+        jmethodID get_assets=(*env)->GetMethodID(env,host_class,"getAssets","()Landroid/content/res/AssetManager;");
+        jobject assets=(*env)->CallObjectMethod(env,instance,get_assets);
+        if (!assets || (*env)->ExceptionCheck(env)) stop("Asset manager unavailable","getAssets");
+        bundle_assets=(*env)->NewGlobalRef(env,assets);
+        bundle_asset_manager=AAssetManager_fromJava(env,bundle_assets);
+        (*env)->DeleteLocalRef(env,assets);
+        (*env)->DeleteLocalRef(env,host_class);
+        if (!bundle_asset_manager) stop("Asset manager unavailable","AAssetManager_fromJava");
         preference_method=(*env)->GetMethodID(env,(*env)->GetObjectClass(env,instance),"preference","(Ljava/lang/String;I)I");
         bundle_file_method=(*env)->GetMethodID(env,(*env)->GetObjectClass(env,instance),"bundleFile","(Ljava/lang/String;)Ljava/lang/String;");
         bundle_exists_method=(*env)->GetMethodID(env,(*env)->GetObjectClass(env,instance),"bundleExists","(Ljava/lang/String;)Z");

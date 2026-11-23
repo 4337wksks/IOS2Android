@@ -249,14 +249,20 @@ static Word split_string(Word self,const char *selector,Word delimiter) {
 }
 
 static Word data_from_file(Word cls,const char *selector,Word filename) {
-    char *path=native_path(string_bytes(filename,selector));
-    if (!path) return 0;
-    int fd=open(path,O_RDONLY|O_CLOEXEC);
-    free(path);
-    if (fd<0) return 0;
-    struct stat info;
-    if (fstat(fd,&info) || info.st_size<0 || (uint64_t)info.st_size>SIZE_MAX-sizeof(struct HostObject)) { close(fd); return 0; }
-    size_t length=(size_t)info.st_size;
+    const char *path=string_bytes(filename,selector);
+    FILE *file=read_only_file(path);
+    if (!file) return 0;
+    int fd=fileno(file);
+    int64_t size;
+    if (fd>=0) {
+        struct stat info;
+        if (fstat(fd,&info)) { fclose(file); return 0; }
+        size=info.st_size;
+    } else {
+        if (fseeko(file,0,SEEK_END) || (size=ftello(file))<0 || fseeko(file,0,SEEK_SET)) { fclose(file); return 0; }
+    }
+    if (size<0 || (uint64_t)size>SIZE_MAX-sizeof(struct HostObject)) { fclose(file); return 0; }
+    size_t length=(size_t)size;
     struct HostObject *data=calloc(1,sizeof(*data)+length);
     if (!data) stop("Allocation failed",selector);
     data->isa=cls;
@@ -266,12 +272,11 @@ static Word data_from_file(Word cls,const char *selector,Word filename) {
     }
     size_t done=0;
     while (done<length) {
-        ssize_t count=read(fd,(char *)(data+1)+done,length-done);
-        if (count<0 && errno==EINTR) continue;
-        if (count<=0) { close(fd); free(data); return 0; }
-        done+=(size_t)count;
+        size_t count=fread((char *)(data+1)+done,1,length-done,file);
+        if (!count) { fclose(file); free(data); return 0; }
+        done+=count;
     }
-    close(fd);
+    fclose(file);
     return (Word)data;
 }
 

@@ -104,11 +104,8 @@ static Word manager_exists_simple(Word self,const char *selector,Word path) { re
 
 static Word manager_file_attributes(Word self,const char *selector,Word filename,Word *error) {
     const char *name=string_bytes(filename,selector);
-    char *path=native_path(name);
-    if (!path) return file_failure(error,name,ENOENT);
     struct stat info;
-    if (stat(path,&info)) { int code=errno; free(path); return file_failure(error,name,code); }
-    free(path);
+    if (read_only_stat(name,&info)) return file_failure(error,name,errno);
     struct GuestMap *attributes=(void *)empty_map(external_class("_OBJC_CLASS_$_NSDictionary"));
     map_set(attributes,selector,number_integer(info.st_size),copy_string("NSFileSize"));
     map_set(attributes,selector,number_integer(info.st_mode&07777),copy_string("NSFilePosixPermissions"));

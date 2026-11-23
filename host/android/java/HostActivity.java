@@ -1384,6 +1384,23 @@ public final class HostActivity extends Activity {
         return target.getPath();
     }
 
+    private void pruneBundleCaches() {
+        File[] entries = getCacheDir().listFiles();
+        if (entries == null) return;
+        String current = "bundle-" + BuildProfile.BUNDLE_REVISION;
+        for (File entry : entries) {
+            if (!entry.getName().matches("bundle-[0-9a-f]{12}") || entry.getName().equals(current)) continue;
+            try (java.util.stream.Stream<java.nio.file.Path> paths = Files.walk(entry.toPath())) {
+                paths.sorted(java.util.Comparator.reverseOrder()).forEach(path -> {
+                    try { Files.deleteIfExists(path); }
+                    catch (IOException failure) { Log.w("I2AGuest", "Cannot remove stale bundle cache: " + path); }
+                });
+            } catch (IOException | java.io.UncheckedIOException failure) {
+                Log.w("I2AGuest", "Cannot inspect stale bundle cache: " + entry);
+            }
+        }
+    }
+
     private boolean bundleExists(String relative) {
         if (relative.startsWith("/") || Arrays.asList(relative.split("/")).contains("..")) return false;
         String path = BuildProfile.BUNDLE_NAME + "/" + relative;
@@ -1430,6 +1447,7 @@ public final class HostActivity extends Activity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        operationWorkers.execute(this::pruneBundleCaches);
         photos = new PhotoWriter(this, mainHandler, operationWorkers, (token, code, description) -> {
             String failure = completePhotoWrite(token, code, description);
             if (failure != null) guestFailure(failure);

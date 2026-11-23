@@ -84,6 +84,7 @@ static FILE *guest_fopen(const char *path,const char *mode) {
     if (!path || !mode || !*mode) { errno=EINVAL; return NULL; }
     int writing=*mode!='r' || strchr(mode,'+')!=NULL;
     if (writing && !writable_sandbox_path(path)) return NULL;
+    if ((!strcmp(mode,"r") || !strcmp(mode,"rb")) && BUNDLE_STREAMING && bundle_relative(path)) return read_only_file(path);
     char *native=native_path(path);
     if (!native) return NULL;
     FILE *stream=fopen(native,mode);
