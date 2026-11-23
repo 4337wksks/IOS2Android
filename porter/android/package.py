@@ -349,9 +349,12 @@ def build_apk(context, source, manifest, resources, catalog, overlays, native, d
             "assets/licenses/Imagination-PVRTC.txt",
             compress_type=zipfile.ZIP_DEFLATED,
         )
-    if adapter and hasattr(adapter, "prepare_package"):
-        adapter.prepare_package(context, unsigned)
-    run(context, tools["sdk"] / "zipalign.exe", "-f", 16384, unsigned, "aligned.apk")
+    package_options = adapter.prepare_package(context, unsigned) if adapter and hasattr(adapter, "prepare_package") else None
+    package_options = package_options or {}
+    alignment = package_options.get("alignment", 16384)
+    native_alignment = package_options.get("native_page_alignment")
+    align_options = ["-P", native_alignment] if native_alignment is not None else []
+    run(context, tools["sdk"] / "zipalign.exe", *align_options, "-f", alignment, unsigned, "aligned.apk")
     signer = tools["sdk"] / "lib/apksigner.jar"
     sign = context.signing
     run(

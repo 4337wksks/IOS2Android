@@ -311,6 +311,7 @@ public final class HostActivity extends Activity {
     private android.text.SpannableStringBuilder createGuestText(String text) { return new android.text.SpannableStringBuilder(text); }
     private float addGuestTextRun(android.text.SpannableStringBuilder text,int start,int end,String name,int traits,float size,int color,int alignment,float spacing,float kern,float baseline) { return guestText.run(text,start,end,name,traits,size,color,alignment,spacing,kern,baseline); }
     private void addGuestTextAttachment(android.text.SpannableStringBuilder text,int index,byte[] png,float[] bounds,boolean template) { guestText.attachment(text,index,png,bounds,template); }
+    private void addGuestTextLink(android.text.SpannableStringBuilder text,int start,int end,String url) { TextRenderer.link(text,start,end,url); }
     private static final class LabelUpdate {
         final long owner; final CharSequence text; final float[] metrics; final int[] options;
         LabelUpdate(long owner,CharSequence text, float[] metrics, int[] options) { this.owner=owner;this.text=text; this.metrics=metrics; this.options=options; }
@@ -555,8 +556,8 @@ public final class HostActivity extends Activity {
     }
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
-        if (shares!=null) shares.result(request,result);
         if(photos!=null && photos.result(request,result,data))return;
+        if (shares!=null) shares.result(request,result);
     }
     private void dismissGuestShare(long token, long completion) {
         mainHandler.post(() -> {
@@ -936,6 +937,27 @@ public final class HostActivity extends Activity {
     private native String completeAlert(long alert, int action);
     private native String editAlertField(long alert, int index, String value);
     private native String completeModalDismiss(long block);
+    private final ConcurrentHashMap<Long, GuestModal> customGuestModals = new ConcurrentHashMap<>();
+    private GuestModal createGuestModal(String presentation,CharSequence title,CharSequence message,CharSequence[] actions,float scale,byte[] image,java.util.function.IntConsumer select) {
+        return null;
+    }
+    private void showGuestModal(long token,String presentation,CharSequence title,CharSequence message,CharSequence[] actions,float scale,byte[] image,boolean animated) {
+        mainHandler.post(() -> {
+            if (isFinishing() || isDestroyed()) return;
+            GuestModal dialog=createGuestModal(presentation,title,message,actions,scale,image,action -> {
+                if (!customGuestModals.containsKey(token)) return;
+                String failure=completeAlert(token,action);
+                if (failure!=null) guestFailure(failure);
+            });
+            if (dialog==null) { guestFailure("Unavailable modal presentation: "+presentation); return; }
+            customGuestModals.put(token,dialog);
+            dialog.show(animated,() -> {
+                if(customGuestModals.get(token)!=dialog)return;
+                String failure=completeAlert(token,-1);
+                if (failure!=null) guestFailure(failure);
+            });
+        });
+    }
     private final ConcurrentHashMap<Long, ModalPresenter> guestAlerts = new ConcurrentHashMap<>();
     private void selectGuestAlert(long token, ModalPresenter dialog, int action) {
         if (!guestAlerts.remove(token,dialog)) return;
@@ -961,19 +983,26 @@ public final class HostActivity extends Activity {
     }
     private void setGuestAlertActionEnabled(long token, int index, boolean enabled) {
         mainHandler.post(() -> {
+            GuestModal custom=customGuestModals.get(token);
+            if (custom!=null) { custom.actionEnabled(index,enabled); return; }
             ModalPresenter dialog=guestAlerts.get(token);
             if (dialog!=null) dialog.actionEnabled(index,enabled);
         });
     }
-    private void dismissGuestAlert(long token, long completion) {
+    private void dismissGuestAlert(long token, long completion,boolean animated) {
         mainHandler.post(() -> {
+            GuestModal custom=customGuestModals.remove(token);
+            if (custom!=null) { custom.dismiss(animated,() -> finishGuestModalDismiss(token,completion)); return; }
             ModalPresenter dialog=guestAlerts.remove(token);
             if (dialog!=null) dialog.dismiss();
-            String dismissed=completeAlert(token,-3);
-            if (dismissed!=null) guestFailure(dismissed);
-            String failure=completeModalDismiss(completion);
-            if (failure!=null) guestFailure(failure);
+            finishGuestModalDismiss(token,completion);
         });
+    }
+    private void finishGuestModalDismiss(long token,long completion) {
+        String dismissed=completeAlert(token,-3);
+        if (dismissed!=null) guestFailure(dismissed);
+        String failure=completeModalDismiss(completion);
+        if (failure!=null) guestFailure(failure);
     }
     private void guestHaptic(int kind) {
         mainHandler.post(() -> getWindow().getDecorView().performHapticFeedback(
@@ -1129,6 +1158,8 @@ public final class HostActivity extends Activity {
     }
 
     @Override public void onDestroy() {
+        for (GuestModal dialog:customGuestModals.values()) dialog.dismiss(false,() -> {});
+        customGuestModals.clear();
         if(tableContent!=null)tableContent.close();
         if(webContent!=null)webContent.close();
         if(textEditors!=null)textEditors.close();
@@ -1779,6 +1810,10 @@ public final class HostActivity extends Activity {
         photos = new PhotoLibrary(this, mainHandler, operationWorkers, (token, code, description) -> {
             String failure = completePhotoWrite(token, code, description);
             if (failure != null) guestFailure(failure);
+        },new PhotoLibrary.Events(){
+            public void selected(long token,int result,String metadata,byte[] bytes){String failure=completePhotoPicker(token,result,metadata,bytes);if(failure!=null)guestFailure(failure);}
+            public void read(long token,byte[] bytes,String metadata,int error){String failure=completePhotoRead(token,bytes,metadata,error);if(failure!=null)guestFailure(failure);}
+            public void authorized(long token,int result){String failure=completePhotoAuthorization(token,result);if(failure!=null)guestFailure(failure);}
         });
         motion = new MotionSource(this, this::deliverDeviceMotion, this::guestFailure);
         keychain = new CredentialStore(this);
@@ -1809,10 +1844,6 @@ public final class HostActivity extends Activity {
             @Override public void surfaceCreated(android.view.SurfaceHolder holder) {}
             @Override public void surfaceChanged(android.view.SurfaceHolder holder, int format, int width, int height) {
                 if (!libraryLoaded) return;
-        },new PhotoLibrary.Events(){
-            public void selected(long token,int result,String metadata,byte[] bytes){String failure=completePhotoPicker(token,result,metadata,bytes);if(failure!=null)guestFailure(failure);}
-            public void read(long token,byte[] bytes,String metadata,int error){String failure=completePhotoRead(token,bytes,metadata,error);if(failure!=null)guestFailure(failure);}
-            public void authorized(long token,int result){String failure=completePhotoAuthorization(token,result);if(failure!=null)guestFailure(failure);}
                 setRenderSurface(holder.getSurface(), width, height);
                 if (!guestStarted) {
                     guestStarted = true;

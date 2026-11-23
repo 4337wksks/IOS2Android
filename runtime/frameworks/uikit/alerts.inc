@@ -1,6 +1,6 @@
  
 struct UIKitLegacyAlert;
-struct UIKitAlert { Word isa,title,message,actions,presenter,present_completion,attributed_title,attributed_message,controller,fields; struct UIKitLegacyAlert *legacy; unsigned style,presented,submitting,external_modal; };
+struct UIKitAlert { Word isa,title,message,actions,presenter,present_completion,attributed_title,attributed_message,controller,fields; struct UIKitLegacyAlert *legacy; unsigned style,presented,submitting,external_modal,animated; struct I2AModal custom; };
 struct UIKitLegacyAlert { Word isa,delegate; struct UIKitAlert *alert; intptr_t cancel,destructive,dismiss_index; unsigned sheet,dismissing; };
 static struct UIKitAlert *storyboard_capability_alert(Word);
 static void storyboard_capability_close(Word);
@@ -88,6 +88,7 @@ static struct UIKitAlert *extension_modal(Word controller,const char *selector) 
         Word action=ui_alert_action(external_class("_OBJC_CLASS_$_UIAlertAction"),selector,description.actions[i].title,description.actions[i].style,0);
         ui_alert_add(alert,selector,(void *)action);
     }
+    alert->custom=description;
     return alert;
 }
 static void ui_controller_present(Word object,const char *selector,Word controller,Word animated,Word completion) {
@@ -99,19 +100,50 @@ static void ui_controller_present(Word object,const char *selector,Word controll
     if (!controller || view_state(object)->presented || view_state(controller)->presenting)
         stop("Unsupported or already presented controller",selector);
     if (read_word(controller)==external_class("_OBJC_CLASS_$_UIActivityViewController")) { ui_share_present(object,selector,controller,completion); return; }
-    struct UIKitAlert *alert;
     if(class_inherits(read_word(controller),external_class("_OBJC_CLASS_$_UIImagePickerController"))){photo_present(object,selector,controller,completion);return;}
+    struct UIKitAlert *alert;
     unsigned external_modal=0;
     if (class_inherits(read_word(controller),external_class("_OBJC_CLASS_$_UIAlertController"))) alert=(void *)controller;
     else if (view_state(controller)->deferred_storyboard) alert=storyboard_capability_alert(controller);
     else { alert=extension_modal(controller,selector); if (!alert) stop("Unsupported modal controller",class_name(read_word(controller)) ? class_name(read_word(controller)) : selector); external_modal=1; }
     alert->external_modal=external_modal;
+    alert->animated=animated!=0;
     alert->controller=controller; alert->presented=1; alert->presenter=object;
     view_state(object)->presented=controller; view_state(controller)->presenting=object; view_state(controller)->modal_alert=(Word)alert;
     alert->present_completion=completion ? (Word)_Block_copy((void *)completion) : 0;
     ui_alert_present(alert,selector);
 }
+static jobject ui_modal_text(JNIEnv *env,jclass cls,Word plain,Word attributed,long alignment,unsigned tint) {
+    struct UIKitColor color={external_class("_OBJC_CLASS_$_UIColor"),((tint>>16)&255)/255.0,((tint>>8)&255)/255.0,(tint&255)/255.0,1};
+    struct LabelState state={.text=attributed ? attributed_string(attributed) : plain ? plain : copy_string(""),.attributed=attributed,.alignment=alignment,.color=(Word)&color};
+    jobject text=(*env)->NewLocalRef(env,label_rich_text(env,cls,&state));
+    (*env)->DeleteGlobalRef(env,state.rich_text); return text;
+}
+static void ui_custom_modal_present(struct UIKitAlert *alert,const char *selector) {
+    struct I2AModal *description=&alert->custom;
+    JNIEnv *env=attached_environment(selector); jclass cls=(*env)->GetObjectClass(env,activity),sequence=(*env)->FindClass(env,"java/lang/CharSequence");
+    jmethodID show=(*env)->GetMethodID(env,cls,"showGuestModal","(JLjava/lang/String;Ljava/lang/CharSequence;Ljava/lang/CharSequence;[Ljava/lang/CharSequence;F[BZ)V");
+    jobject title=ui_modal_text(env,cls,description->title,description->attributed_title,1,0),message=ui_modal_text(env,cls,description->message,description->attributed_message,0,0);
+    jobjectArray actions=(*env)->NewObjectArray(env,description->count,sequence,NULL);
+    for (unsigned i=0;i<description->count;++i) {
+        jobject text=ui_modal_text(env,cls,description->actions[i].title,description->actions[i].attributed_title,1,0x007aff);
+        (*env)->SetObjectArrayElement(env,actions,i,text); (*env)->DeleteLocalRef(env,text);
+    }
+    jbyteArray image=NULL;
+    if (description->image_name) {
+        Word original=ui_image_named(external_class("_OBJC_CLASS_$_UIImage"),"imageNamed:",copy_string(description->image_name));
+        struct HostObject *png=original ? (void *)image_png((void *)original) : NULL;
+        if (!png || png->content[0]>INT32_MAX) stop("Invalid external modal image",description->image_name);
+        image=(*env)->NewByteArray(env,png->content[0]); (*env)->SetByteArrayRegion(env,image,0,png->content[0],(void *)data_buffer(png));
+    }
+    jstring name=(*env)->NewStringUTF(env,description->presentation);
+    (*env)->CallVoidMethod(env,activity,show,(jlong)alert,name,title,message,actions,(jfloat)screen_scale(),image,(jboolean)alert->animated);
+    if (image) (*env)->DeleteLocalRef(env,image);
+    (*env)->DeleteLocalRef(env,name); (*env)->DeleteLocalRef(env,title); (*env)->DeleteLocalRef(env,message); (*env)->DeleteLocalRef(env,actions); (*env)->DeleteLocalRef(env,sequence); (*env)->DeleteLocalRef(env,cls);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); stop("Android custom modal failed",selector); }
+}
 static void ui_alert_present(struct UIKitAlert *alert,const char *selector) {
+    if (alert->custom.presentation) { ui_custom_modal_present(alert,selector); return; }
     JNIEnv *env=attached_environment(selector); jclass cls=(*env)->GetObjectClass(env,activity),string=(*env)->FindClass(env,"java/lang/String");
     jmethodID show=(*env)->GetMethodID(env,cls,"showGuestAlert","(JIILjava/lang/String;Ljava/lang/String;[Ljava/lang/String;[Z[I[Ljava/lang/String;[Ljava/lang/String;[I)V");
     struct Sequence *actions=(void *)alert->actions;
@@ -210,22 +242,22 @@ static void ui_legacy_show(Word object,const char *selector) {
     legacy->alert->presented=1; legacy->dismissing=0;
     schedule_main_function(ui_legacy_show_deliver,legacy);
 }
-struct UIKitLegacyDismiss { struct UIKitLegacyAlert *legacy; intptr_t index; };
+struct UIKitLegacyDismiss { struct UIKitLegacyAlert *legacy; intptr_t index; unsigned animated; };
 static void ui_legacy_dismiss_deliver(void *context) {
     struct UIKitLegacyDismiss *request=context; struct UIKitLegacyAlert *legacy=request->legacy;
-    intptr_t index=request->index; free(request);
+    intptr_t index=request->index; unsigned animated=request->animated; free(request);
     if (!legacy->alert->presented || legacy->dismissing) return;
     ui_legacy_begin_dismiss(legacy,index,0,0);
     JNIEnv *env=attached_environment("dismissWithClickedButtonIndex:animated:"); jclass cls=(*env)->GetObjectClass(env,activity);
-    jmethodID dismiss=(*env)->GetMethodID(env,cls,"dismissGuestAlert","(JJ)V");
-    (*env)->CallVoidMethod(env,activity,dismiss,(jlong)legacy->alert,(jlong)0); (*env)->DeleteLocalRef(env,cls);
+    jmethodID dismiss=(*env)->GetMethodID(env,cls,"dismissGuestAlert","(JJZ)V");
+    (*env)->CallVoidMethod(env,activity,dismiss,(jlong)legacy->alert,(jlong)0,(jboolean)animated); (*env)->DeleteLocalRef(env,cls);
 }
 static void ui_legacy_dismiss(Word object,const char *selector,intptr_t index,Word animated) {
     struct UIKitLegacyAlert *legacy=(void *)object; if (!legacy->alert || !legacy->alert->presented) return;
     struct Sequence *actions=(void *)legacy->alert->actions;
     if (index < -1 || (index>=0 && (size_t)index>=actions->count)) stop("Invalid alert button index",selector);
     struct UIKitLegacyDismiss *request=malloc(sizeof(*request)); if (!request) stop("Allocation failed",selector);
-    *request=(struct UIKitLegacyDismiss){legacy,index}; schedule_main_function(ui_legacy_dismiss_deliver,request);
+    *request=(struct UIKitLegacyDismiss){legacy,index,animated!=0}; schedule_main_function(ui_legacy_dismiss_deliver,request);
 }
 static Word ui_legacy_property(Word object,const char *selector) {
     ui_legacy_initialize(object,selector); struct UIKitLegacyAlert *legacy=(void *)object;
@@ -263,11 +295,12 @@ static void ui_controller_dismiss(Word object,const char *selector,Word animated
     Word copied=completion ? (Word)_Block_copy((void *)completion) : 0;
     if (target) {
         if (read_word(target)==external_class("_OBJC_CLASS_$_UIActivityViewController")) { ui_share_dismiss(target,selector,copied); return; }
+        if(class_inherits(read_word(target),external_class("_OBJC_CLASS_$_UIImagePickerController"))){photo_dismiss(target,selector,copied);return;}
         struct UIKitAlert *alert=(void *)view_state(target)->modal_alert;
         if (!alert) stop("Unsupported modal controller",selector);
         ui_alert_clear(alert);
         JNIEnv *env=attached_environment(selector); jclass cls=(*env)->GetObjectClass(env,activity);
-        jmethodID dismiss=(*env)->GetMethodID(env,cls,"dismissGuestAlert","(JJ)V"); (*env)->CallVoidMethod(env,activity,dismiss,(jlong)alert,(jlong)copied); (*env)->DeleteLocalRef(env,cls);
+        jmethodID dismiss=(*env)->GetMethodID(env,cls,"dismissGuestAlert","(JJZ)V"); (*env)->CallVoidMethod(env,activity,dismiss,(jlong)alert,(jlong)copied,(jboolean)(animated!=0)); (*env)->DeleteLocalRef(env,cls);
         if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); stop("Android modal dismissal failed",selector); }
         return;
     }
@@ -295,7 +328,6 @@ JNIEXPORT jstring JNICALL HOST_JNI(HostActivity_completeAlert)(JNIEnv *env,jobje
             intptr_t selected=index==-2 ? legacy->cancel : index;
             struct Sequence *actions=(void *)alert->actions;
             if (selected < -1 || (selected>=0 && (size_t)selected>=actions->count)) stop("Invalid alert action index","UIKit");
-        if(class_inherits(read_word(target),external_class("_OBJC_CLASS_$_UIImagePickerController"))){photo_dismiss(target,selector,copied);return;}
             ui_legacy_begin_dismiss(legacy,selected,index>=0,index==-2);
         }
     } else if (!failed && index==-1) {

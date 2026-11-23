@@ -10,6 +10,17 @@ final class TextRenderer {
     private final Context context;
     private final HashMap<String, Typeface> fonts = new HashMap<>();
     TextRenderer(Context context) { this.context=context; }
+    static void link(SpannableStringBuilder text,int start,int end,String url) {
+        if (url==null || url.isEmpty() || start>=end) return;
+        text.setSpan(new URLSpan(url) {
+            @Override public void onClick(android.view.View view) {
+                try { super.onClick(view); }
+                catch (android.content.ActivityNotFoundException | SecurityException unavailable) {
+                    android.widget.Toast.makeText(view.getContext(),"Unable to open this link.",android.widget.Toast.LENGTH_SHORT).show();
+                }
+            }
+        },start,end,Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+    }
     private Typeface font(String name, int traits) {
         String key=name+":"+traits;
         Typeface result=fonts.get(key);

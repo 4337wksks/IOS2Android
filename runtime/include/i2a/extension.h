@@ -3,15 +3,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define I2A_RUNTIME_INTERFACE 1
+#define I2A_RUNTIME_INTERFACE 2
 typedef uintptr_t I2AObject;
 typedef I2AObject (*I2AMethod)(I2AObject,const char *,I2AObject,I2AObject,I2AObject,I2AObject);
 struct I2ADisplay { int width,height; double scale; };
-struct I2AModalAction { I2AObject title; unsigned style; };
+struct I2AModalAction { I2AObject title; unsigned style; I2AObject attributed_title; };
 struct I2AModal {
     I2AObject title,message;
     unsigned style,count;
     struct I2AModalAction actions[8];
+    /* Optional adapter-owned presentation. Text attributes use the UIKit bridge. */
+    const char *presentation,*image_name;
+    I2AObject attributed_title,attributed_message;
 };
 struct I2ARuntimeAPI {
     unsigned version,size;

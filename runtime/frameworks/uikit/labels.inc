@@ -49,7 +49,7 @@ static void label_content_changed(struct LabelState *state) {
 }
 static Word label_attribute(struct GuestMap *attributes,const char *name) {
      
-    static const char *names[]={"NSFont","NSColor","NSAttachment","NSParagraphStyle","NSKern","NSBaselineOffset"};
+    static const char *names[]={"NSFont","NSColor","NSAttachment","NSParagraphStyle","NSKern","NSBaselineOffset","NSLink"};
     static Word keys[COUNT(names)];
     for (unsigned i=0;i<COUNT(names);++i) if (!strcmp(name,names[i])) {
         if (!keys[i]) keys[i]=copy_string(name);
@@ -82,6 +82,16 @@ static jobject label_rich_text(JNIEnv *env,jclass cls,struct LabelState *state) 
             (jint)label_argb(color ? color : state->color,0xff000000),(jint)(p ? p->integers[0] : state->alignment),
             (jfloat)(p ? p->metrics[0]*scale : 0),(jfloat)(kern ? numeric_double((void *)kern)*scale : 0),(jfloat)(baseline ? numeric_double((void *)baseline)*scale : 0));
         (*env)->DeleteLocalRef(env,family);
+        Word link=label_attribute(attributes,"NSLink");
+        if (link) {
+            Method absolute=find_implementation(link,"absoluteString");
+            Word address=absolute ? absolute(link,"absoluteString",0,0,0,0) : link;
+            jstring url=http_java_string(env,address);
+            static jmethodID add_link;
+            if(!add_link)add_link=(*env)->GetMethodID(env,cls,"addGuestTextLink","(Landroid/text/SpannableStringBuilder;IILjava/lang/String;)V");
+            (*env)->CallVoidMethod(env,activity,add_link,result,(jint)index,(jint)(range.location+range.length),url);
+            if (url) (*env)->DeleteLocalRef(env,url);
+        }
         if (attachment) {
             Word original=text_attachment(attachment)->image;
             struct HostObject *png=(void *)image_png((void *)original);
