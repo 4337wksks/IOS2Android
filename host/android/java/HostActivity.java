@@ -556,6 +556,7 @@ public final class HostActivity extends Activity {
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
         if (shares!=null) shares.result(request,result);
+        if(photos!=null && photos.result(request,result,data))return;
     }
     private void dismissGuestShare(long token, long completion) {
         mainHandler.post(() -> {
@@ -879,7 +880,19 @@ public final class HostActivity extends Activity {
     private final HttpTransport http = new HttpTransport(mainHandler, operationWorkers, this::guestFailure);
     private final AudioOutput sound = new AudioOutput(mainHandler, this::guestFailure);
     private AudioSession audioSession;
-    private PhotoWriter photos;
+    private PhotoLibrary photos;
+    private native String completePhotoPicker(long token,int result,String metadata,byte[] bytes);
+    private native String completePhotoRead(long token,byte[] bytes,String metadata,int error);
+    private native String completePhotoAuthorization(long token,int result);
+    private boolean photoSourceAvailable(int source){return photos.sourceAvailable(source);}
+    private int photoAuthorization(int access){return photos.authorization(access);}
+    private void authorizePhotos(long token,int access){photos.authorize(token,access);}
+    private void showGuestPhotoPicker(long token){photos.pick(token);}
+    private void dismissGuestPhotoPicker(long token,long completion){photos.dismiss(token);mainHandler.post(()->{String failure=completeModalDismiss(completion);if(failure!=null)guestFailure(failure);});}
+    private String[] fetchPhotoAssets(String[] identifiers,int limit){return photos.assets(identifiers,limit);}
+    private Object[] readPhotoData(String uri,int[] options){return photos.read(uri,options);}
+    private void requestPhotoData(long token,String uri,int[] options){photos.request(token,uri,options);}
+    private void cancelPhotoRequest(long token){photos.cancel(token);}
     private native String completePhotoWrite(long token, long code, String description);
     private void saveGuestPhoto(long token, byte[] bytes) { photos.save(token, bytes); }
     @Override public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
@@ -1763,7 +1776,7 @@ public final class HostActivity extends Activity {
         cleanRuntimeCaches();
         NotificationScheduler.attach(notificationDelivery);
         receiveNotificationIntent(getIntent());
-        photos = new PhotoWriter(this, mainHandler, operationWorkers, (token, code, description) -> {
+        photos = new PhotoLibrary(this, mainHandler, operationWorkers, (token, code, description) -> {
             String failure = completePhotoWrite(token, code, description);
             if (failure != null) guestFailure(failure);
         });
@@ -1796,6 +1809,10 @@ public final class HostActivity extends Activity {
             @Override public void surfaceCreated(android.view.SurfaceHolder holder) {}
             @Override public void surfaceChanged(android.view.SurfaceHolder holder, int format, int width, int height) {
                 if (!libraryLoaded) return;
+        },new PhotoLibrary.Events(){
+            public void selected(long token,int result,String metadata,byte[] bytes){String failure=completePhotoPicker(token,result,metadata,bytes);if(failure!=null)guestFailure(failure);}
+            public void read(long token,byte[] bytes,String metadata,int error){String failure=completePhotoRead(token,bytes,metadata,error);if(failure!=null)guestFailure(failure);}
+            public void authorized(long token,int result){String failure=completePhotoAuthorization(token,result);if(failure!=null)guestFailure(failure);}
                 setRenderSurface(holder.getSurface(), width, height);
                 if (!guestStarted) {
                     guestStarted = true;

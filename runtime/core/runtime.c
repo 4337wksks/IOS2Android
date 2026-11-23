@@ -124,6 +124,8 @@ static const char *const extra_class_names[]={
     , "_OBJC_CLASS_$_UIScrollView", "_OBJC_CLASS_$_UITextView"
     , "_OBJC_CLASS_$_CLLocation", "_OBJC_CLASS_$_CLLocationManager", "_OBJC_CLASS_$_CLLocationSourceInformation", "_OBJC_CLASS_$_CLGeocoder", "_OBJC_CLASS_$_CLPlacemark"
     , "_OBJC_CLASS_$_CNPostalAddress", "_OBJC_CLASS_$_CNMutablePostalAddress"
+    , "_OBJC_CLASS_$_UIImagePickerController", "_OBJC_CLASS_$_PHAsset", "_OBJC_CLASS_$_PHFetchResult", "_OBJC_CLASS_$_PHFetchOptions"
+    , "_OBJC_CLASS_$_PHImageManager", "_OBJC_CLASS_$_PHImageRequestOptions", "_OBJC_CLASS_$_PHPhotoLibrary"
 };
 static Word extra_class_objects[COUNT(extra_class_names)][4];
 static void initialize_guest_class(Word cls);
@@ -1669,6 +1671,8 @@ static Method framework_implementation(Word object,const char *selector,const ch
     found=ui_labels_method(object,selector,receiver,class_receiver);
     if (found) return found;
     found=ui_platform_method(object,selector,receiver,class_receiver);
+    if (found) return found;
+    found=photos_method(object,selector,receiver,class_receiver);
     if (found) return found;
     found=ui_share_method(object,selector,receiver,class_receiver);
     if (found) return found;

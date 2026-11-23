@@ -74,6 +74,7 @@ APKs are written to `out/<application-id>/<CFBundleVersion>/dev|release/` in the
 - Scene lifecycle, complex NIBs, layout, animation, general scrolling, and text editing still have compatibility gaps; not every native interface can be rendered.
 - Tables still lack constraint-based automatic row heights, NIB cells, editing/reordering, insertion/deletion animations, and complete grouped styling. Offscreen row geometry may use estimated heights.
 - Web pages support basic loading and interaction. Multiple windows, downloads, and some navigation and scripting APIs remain unsupported.
+- Photo support still lacks camera capture, cropping, video, iCloud versions, library change observation, and complete query options. Legacy iOS photo identifiers cannot directly identify Android files.
 - Metal-to-Vulkan and MSL/AIR translation cover only the interfaces and translation paths currently implemented.
 - Audio format support is limited, and real-time AudioQueue playback is not implemented.
 - Full calendar/location notification triggers, notification actions and attachments, Bonjour browsing/resolution, and gesture failure dependencies and arbitration are not implemented.

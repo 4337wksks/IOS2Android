@@ -182,6 +182,9 @@ def build_host(context, revision, fonts, resources, launch_screen, adapter=None)
     ]
     (sources / "BuildProfile.java").write_text("\n".join(profile) + "\n", encoding="utf-8")
     template = (ROOT / "host/android/templates/AndroidManifest.xml").read_text(encoding="utf-8")
+    if context.info.get("NSPhotoLibraryUsageDescription"):
+        permissions = '<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/><uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/><uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED"/>'
+        template = template.replace("<queries>", permissions + "<queries>")
     if any(context.info.get(key) for key in ("NSLocationWhenInUseUsageDescription", "NSLocationAlwaysUsageDescription", "NSLocationAlwaysAndWhenInUseUsageDescription")):
         permissions = '<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/><uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>'
         template = template.replace("<queries>", permissions + "<queries>")

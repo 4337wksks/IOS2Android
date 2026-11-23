@@ -100,6 +100,7 @@ static void ui_controller_present(Word object,const char *selector,Word controll
         stop("Unsupported or already presented controller",selector);
     if (read_word(controller)==external_class("_OBJC_CLASS_$_UIActivityViewController")) { ui_share_present(object,selector,controller,completion); return; }
     struct UIKitAlert *alert;
+    if(class_inherits(read_word(controller),external_class("_OBJC_CLASS_$_UIImagePickerController"))){photo_present(object,selector,controller,completion);return;}
     unsigned external_modal=0;
     if (class_inherits(read_word(controller),external_class("_OBJC_CLASS_$_UIAlertController"))) alert=(void *)controller;
     else if (view_state(controller)->deferred_storyboard) alert=storyboard_capability_alert(controller);
@@ -294,6 +295,7 @@ JNIEXPORT jstring JNICALL HOST_JNI(HostActivity_completeAlert)(JNIEnv *env,jobje
             intptr_t selected=index==-2 ? legacy->cancel : index;
             struct Sequence *actions=(void *)alert->actions;
             if (selected < -1 || (selected>=0 && (size_t)selected>=actions->count)) stop("Invalid alert action index","UIKit");
+        if(class_inherits(read_word(target),external_class("_OBJC_CLASS_$_UIImagePickerController"))){photo_dismiss(target,selector,copied);return;}
             ui_legacy_begin_dismiss(legacy,selected,index>=0,index==-2);
         }
     } else if (!failed && index==-1) {
