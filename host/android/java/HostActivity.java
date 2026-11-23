@@ -1137,27 +1137,35 @@ public final class HostActivity extends Activity {
         }
     }
     private int networkFlags() {
-        ConnectivityManager manager = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
-        Network network = manager.getActiveNetwork();
-        NetworkCapabilities capabilities = network == null ? null : manager.getNetworkCapabilities(network);
-        if (capabilities == null) return 0;
-        return 2 | (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ? 0x40000 : 0);
+        try{ConnectivityManager manager = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            Network network = manager==null ? null : manager.getActiveNetwork();
+            NetworkCapabilities capabilities = network == null ? null : manager.getNetworkCapabilities(network);
+            if (capabilities == null) return 0;
+            return 2 | (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ? 0x40000 : 0);
+        }catch(RuntimeException unavailable){return 0;}
     }
+    private boolean batteryMonitorRegistered;
     private void monitorPlatformChanges() {
         IntentFilter filter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
-        if (Build.VERSION.SDK_INT >= 33) registerReceiver(batteryMonitor, filter, Context.RECEIVER_NOT_EXPORTED);
-        else registerReceiver(batteryMonitor, filter);
+        try{if (Build.VERSION.SDK_INT >= 33) registerReceiver(batteryMonitor, filter, Context.RECEIVER_NOT_EXPORTED);
+            else registerReceiver(batteryMonitor, filter);batteryMonitorRegistered=true;
+        }catch(RuntimeException unavailable){Log.w("I2AHost","Battery observer unavailable",unavailable);}
         ConnectivityManager manager = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+        if(manager==null)return;
         networkMonitor = new ConnectivityManager.NetworkCallback() {
-            private void update() { mainHandler.post(() -> { if (guestLoaded) networkChanged(networkFlags()); }); }
+            private void update() { mainHandler.post(() -> { if (guestLoaded && !isDestroyed()) networkChanged(networkFlags()); }); }
             @Override public void onAvailable(Network network) { update(); }
             @Override public void onLost(Network network) { update(); }
             @Override public void onCapabilitiesChanged(Network network, NetworkCapabilities capabilities) { update(); }
         };
-        manager.registerDefaultNetworkCallback(networkMonitor);
+        try{manager.registerDefaultNetworkCallback(networkMonitor);}catch(RuntimeException unavailable){networkMonitor=null;Log.w("I2AHost","Network observer unavailable",unavailable);}
     }
 
     @Override public void onDestroy() {
+        if(batteryMonitorRegistered){try{unregisterReceiver(batteryMonitor);}catch(IllegalArgumentException ignored){}batteryMonitorRegistered=false;}
+        if(networkMonitor!=null){ConnectivityManager manager=(ConnectivityManager)getSystemService(CONNECTIVITY_SERVICE);if(manager!=null)try{manager.unregisterNetworkCallback(networkMonitor);}catch(RuntimeException ignored){}networkMonitor=null;}
+        if(motion!=null)motion.close();
+        if(frameScheduler!=null)frameScheduler.close();
         for (GuestModal dialog:customGuestModals.values()) dialog.dismiss(false,() -> {});
         customGuestModals.clear();
         if(tableContent!=null)tableContent.close();
@@ -1255,7 +1263,8 @@ public final class HostActivity extends Activity {
             if (Build.VERSION.SDK_INT >= 33 && !notificationsEnabled() && !isDestroyed()) {
                 if (notificationPermissions.size() == 1) {
                     NotificationScheduler.requested(this);
-                    requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, NOTIFICATION_PERMISSION);
+                    try{requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, NOTIFICATION_PERMISSION);}
+                    catch(RuntimeException unavailable){completeNotificationPermissions();}
                 }
             } else completeNotificationPermissions();
         });

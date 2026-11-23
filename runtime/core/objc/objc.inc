@@ -1,6 +1,4 @@
-/* Shared Objective-C property, reflection, association and synchronization
- * bridges. Object destruction / autorelease ownership are still a separate
- * runtime milestone; weak slots here follow the current retained lifetime. */
+/* Object destruction remains selective for classes managed by the runtime. */
 
 static Word copied_object(Word value) {
     if (!value) return 0;
@@ -15,11 +13,13 @@ static Word copied_object(Word value) {
 static void copy_property(Word object,const char *selector,Word value,intptr_t offset) {
     value=copied_object(value);
     set_property(object,selector,value,offset);
+    metal_object_release(value);
 }
 
 static void copy_atomic_property(Word object,const char *selector,Word value,intptr_t offset) {
     value=copied_object(value);
     set_atomic_property(object,selector,value,offset);
+    metal_object_release(value);
 }
 
 static Word class_from_name(const char *wanted) {
@@ -63,7 +63,7 @@ static Word change_class(Word object,Word cls) {
     return __atomic_exchange_n((Word *)object,cls,__ATOMIC_ACQ_REL);
 }
 
-static void copy_weak(Word *destination,const Word *source) { *destination=*source; }
+static void copy_weak(Word *destination,const Word *source) { Word value=load_weak_retained((Word *)source);store_weak(destination,value);metal_object_release(value); }
 
 static pthread_mutex_t objc_data_mutex=PTHREAD_MUTEX_INITIALIZER;
 struct Association { Word object, key, value; struct Association *next; };
@@ -342,7 +342,7 @@ static Word resolve_objc_import(const char *name) {
     if (!strcmp(name,"_objc_setProperty_nonatomic_copy")) return (Word)copy_property;
     if (!strcmp(name,"_objc_setProperty_atomic_copy")) return (Word)copy_atomic_property;
     if (!strcmp(name,"_objc_getClass") || !strcmp(name,"_objc_lookUpClass")) return (Word)class_from_name;
-    if (!strcmp(name,"_objc_autorelease")) return (Word)identity;
+    if (!strcmp(name,"_objc_autorelease")) return (Word)metal_object_autorelease;
     if (!strcmp(name,"_objc_copyWeak")) return (Word)copy_weak;
     if (!strcmp(name,"_objc_copyStruct")) return (Word)copy_struct;
     if (!strcmp(name,"_objc_getAssociatedObject")) return (Word)associated_object;

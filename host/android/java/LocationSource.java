@@ -57,12 +57,12 @@ final class LocationSource {
             return permissionRequested || !declared(Manifest.permission.ACCESS_COARSE_LOCATION) ? 2 : 0;
         return Build.VERSION.SDK_INT<29 || granted(Manifest.permission.ACCESS_BACKGROUND_LOCATION) ? 3 : 4;
     }
-    boolean enabled(){return manager!=null && manager.isLocationEnabled();}
+    boolean enabled(){try{return manager!=null && manager.isLocationEnabled();}catch(RuntimeException unavailable){return false;}}
     private boolean declared(String permission){
         return manifestPermissions.contains(permission);
     }
     void requestAuthorization(long token){main.post(()->{
-        if(closed)return;
+        if(closed || activity.isFinishing() || activity.isDestroyed()){String error=authorization.changed(token,2);if(error!=null)failure.accept(error);return;}
         permissionRequests.add(token);
         if(authorization()>=3 || !declared(Manifest.permission.ACCESS_COARSE_LOCATION)){completePermissions();return;}
         if(permissionPending)return;
@@ -71,7 +71,8 @@ final class LocationSource {
         activity.getPreferences(Activity.MODE_PRIVATE).edit().putBoolean("locationPermissionRequested",true).apply();
         ArrayList<String> permissions=new ArrayList<>();permissions.add(Manifest.permission.ACCESS_COARSE_LOCATION);
         if(declared(Manifest.permission.ACCESS_FINE_LOCATION))permissions.add(Manifest.permission.ACCESS_FINE_LOCATION);
-        activity.requestPermissions(permissions.toArray(new String[0]),PERMISSION_REQUEST);
+        try{activity.requestPermissions(permissions.toArray(new String[0]),PERMISSION_REQUEST);}
+        catch(RuntimeException unavailable){permissionPending=false;completePermissions();}
     });}
     void permissionResult(int request){if(request==PERMISSION_REQUEST){permissionPending=false;completePermissions();}}
     private void completePermissions(){
@@ -97,14 +98,14 @@ final class LocationSource {
     double[] lastLocation(){
         if(authorization()<3 || manager==null)return null;
         try{Location latest=null;for(String provider:manager.getProviders(true)){Location value=manager.getLastKnownLocation(provider);if(value!=null && (latest==null || value.getTime()>latest.getTime()))latest=value;}return values(latest);}
-        catch(SecurityException denied){return null;}
+        catch(RuntimeException unavailable){return null;}
     }
     void start(long token,int generation,double accuracy,double distance,boolean once){main.post(()->{
         stop(token);if(closed)return;
         Connection connection=new Connection(token,generation,once);connections.put(token,connection);
         if(authorization()<3){connection.error(1,"Location permission is not granted to this Android application.");return;}
-        String provider=provider(accuracy);if(!enabled() || provider==null){connection.error(0,"A location provider is not available.");return;}
         try{
+            String provider=provider(accuracy);if(!enabled() || provider==null){connection.error(0,"A location provider is not available.");return;}
             if(Build.VERSION.SDK_INT>=31){
                 android.location.LocationRequest request=new android.location.LocationRequest.Builder(0)
                         .setQuality(accuracy<=10 ? android.location.LocationRequest.QUALITY_HIGH_ACCURACY : accuracy<=100 ? android.location.LocationRequest.QUALITY_BALANCED_POWER_ACCURACY : android.location.LocationRequest.QUALITY_LOW_POWER)
@@ -116,11 +117,12 @@ final class LocationSource {
             else manager.requestLocationUpdates(provider,0,once ? 0 : (float)Math.max(0,distance),connection,main.getLooper());
         }catch(SecurityException denied){connection.error(1,"Location permission is not granted to this Android application.");}
         catch(IllegalArgumentException unavailable){connection.error(0,"A location provider is not available.");}
+        catch(RuntimeException unavailable){connection.error(0,"The Android location service could not start this request.");}
     });}
     void stop(long token){
         Connection previous=connections.remove(token);if(previous==null)return;previous.active=false;
         if(previous.cancellation!=null)previous.cancellation.cancel();
-        if(manager!=null)manager.removeUpdates(previous);
+        if(manager!=null)try{manager.removeUpdates(previous);}catch(RuntimeException unavailable){}
     }
     void stopAsync(long token){main.post(()->stop(token));}
     private final class Connection implements LocationListener {
@@ -151,6 +153,7 @@ final class LocationSource {
     void geocode(long token,int generation,String query,double latitude,double longitude,double[] bounds,String language){main.post(()->{
         if(closed)return;
         GeocodeRequest request=new GeocodeRequest(token,generation);geocodes.put(token,request);
+        try{
         if(!Geocoder.isPresent()){request.completed(null,2,"A geocoding service is not available on this Android device.");return;}
         Locale locale=language==null ? activity.getResources().getConfiguration().getLocales().get(0) : Locale.forLanguageTag(language.replace('_','-'));
         Geocoder service=new Geocoder(activity,locale);
@@ -163,11 +166,14 @@ final class LocationSource {
                 else if(bounds!=null && bounds.length==4)service.getFromLocationName(query,10,bounds[0],bounds[1],bounds[2],bounds[3],listener);
                 else service.getFromLocationName(query,10,listener);
             }catch(IllegalArgumentException invalid){request.completed(null,8,"The geocoding coordinates or address are invalid.");}
+            catch(RuntimeException unavailable){request.completed(null,2,"The geocoding service could not complete this request.");}
         }else workers.execute(()->{
             try{List<Address> addresses=query==null ? service.getFromLocation(latitude,longitude,10) : bounds!=null && bounds.length==4 ? service.getFromLocationName(query,10,bounds[0],bounds[1],bounds[2],bounds[3]) : service.getFromLocationName(query,10);request.completed(addresses,0,null);}
             catch(IOException unavailable){request.completed(null,2,"The geocoding service could not complete this request.");}
             catch(IllegalArgumentException invalid){request.completed(null,8,"The geocoding coordinates or address are invalid.");}
+            catch(RuntimeException unavailable){request.completed(null,2,"The geocoding service could not complete this request.");}
         });
+        }catch(RuntimeException unavailable){request.completed(null,2,"A geocoding service is not available on this Android device.");}
     });}
     void cancelGeocode(long token){main.post(()->geocodes.remove(token));}
     private static String encode(List<Address> addresses) throws JSONException {

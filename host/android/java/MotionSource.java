@@ -19,6 +19,7 @@ final class MotionSource {
     private final HashMap<Long, Connection> connections = new HashMap<>();
     private HandlerThread thread;
     private Handler handler;
+    private boolean closed;
     MotionSource(Context context, Delivery delivery, Consumer<String> failure) {
         manager = (SensorManager)context.getSystemService(Context.SENSOR_SERVICE);
         Sensor gameRotationSensor = manager == null ? null : manager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR);
@@ -30,22 +31,24 @@ final class MotionSource {
     boolean available() { return rotation != null && accelerometer != null && gyroscope != null; }
     synchronized boolean start(long token, int generation, double interval) {
         stop(token);
-        if (!available() || !Double.isFinite(interval) || interval <= 0) return false;
+        if (closed || !available() || !Double.isFinite(interval) || interval <= 0) return false;
         if (thread == null) { thread = new HandlerThread("I2A Motion"); thread.start(); handler = new Handler(thread.getLooper()); }
         int period = (int)Math.max(5000, Math.min(1000000, interval * 1000000));
         Connection connection = new Connection(token, generation, (long)(interval * 1000000000));
-        boolean registered = manager.registerListener(connection, accelerometer, period, handler)
+        boolean registered=false;
+        try{registered = manager.registerListener(connection, accelerometer, period, handler)
             && manager.registerListener(connection, gyroscope, period, handler)
-            && manager.registerListener(connection, rotation, period, handler);
-        if (!registered) { connection.active = false; manager.unregisterListener(connection); return false; }
+            && manager.registerListener(connection, rotation, period, handler);}catch(RuntimeException unavailable){}
+        if (!registered) { connection.active = false;try{manager.unregisterListener(connection);}catch(RuntimeException unavailable){}return false; }
         connections.put(token, connection); return true;
     }
     synchronized void stop(long token) {
         Connection previous = connections.remove(token);
-        if (previous != null) { previous.active = false; manager.unregisterListener(previous); }
+        if (previous != null) { previous.active = false;try{manager.unregisterListener(previous);}catch(RuntimeException unavailable){} }
     }
     synchronized void close() {
-        for (Connection connection : connections.values()) { connection.active = false; manager.unregisterListener(connection); }
+        closed=true;
+        for (Connection connection : connections.values()) { connection.active = false;try{manager.unregisterListener(connection);}catch(RuntimeException unavailable){} }
         connections.clear();
         if (thread != null) { thread.quitSafely(); thread = null; handler = null; }
     }

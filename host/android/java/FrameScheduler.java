@@ -10,7 +10,7 @@ final class FrameScheduler implements Choreographer.FrameCallback {
     private final Activity activity;
     private final Consumer<String> failure;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private boolean enabled, foreground = true, pending;
+    private boolean enabled, foreground = true, pending,closed;
     private static native String frame(long timestamp, double refreshRate);
 
     FrameScheduler(Activity activity, Consumer<String> failure) {
@@ -25,10 +25,10 @@ final class FrameScheduler implements Choreographer.FrameCallback {
     }
 
     private void update() {
-        if (enabled && foreground && !pending) {
+        if (!closed && enabled && foreground && !pending) {
             pending = true;
             Choreographer.getInstance().postFrameCallback(this);
-        } else if ((!enabled || !foreground) && pending) {
+        } else if ((closed || !enabled || !foreground) && pending) {
             Choreographer.getInstance().removeFrameCallback(this);
             pending = false;
         }
@@ -36,10 +36,11 @@ final class FrameScheduler implements Choreographer.FrameCallback {
 
     @Override public void doFrame(long timestamp) {
         pending = false;
-        if (!enabled || !foreground) return;
+        if (closed || !enabled || !foreground) return;
         double refresh = activity.getWindowManager().getDefaultDisplay().getRefreshRate();
         String error = frame(timestamp, refresh);
         if (error != null) { enabled = false; failure.accept(error); }
         update();
     }
+    void close(){closed=true;enabled=false;update();mainHandler.removeCallbacksAndMessages(null);}
 }

@@ -224,10 +224,11 @@ final class ModalPresenter extends Dialog {
             failure=new TextView(getContext()); failure.setTextColor(palette.foreground); failure.setTextSize(16); failure.setGravity(Gravity.CENTER);
             failure.setPadding(dp(24),dp(24),dp(24),dp(24)); failure.setVisibility(View.GONE); failure.setFocusable(true);
             failure.setOnClickListener(view->{ if(web!=null) web.reload(); }); content.addView(failure,new LinearLayout.LayoutParams(-1,0,1));
+            try{
             web=new WebView(getContext()); web.setBackgroundColor(palette.surface);
             web.getSettings().setJavaScriptEnabled(true); web.getSettings().setDomStorageEnabled(true);
             web.getSettings().setAllowFileAccess(false); web.getSettings().setAllowContentAccess(false);
-            if(Build.VERSION.SDK_INT>=33) web.getSettings().setAlgorithmicDarkeningAllowed(palette.dark);
+            if(Build.VERSION.SDK_INT>=33)try{web.getSettings().setAlgorithmicDarkeningAllowed(palette.dark);}catch(UnsupportedOperationException | LinkageError unavailable){}
             web.setWebChromeClient(new WebChromeClient() {
                 @Override public void onProgressChanged(WebView view,int value) {
                     progress.setProgress(value); progress.setVisibility(value==100 || failed ? View.GONE : View.VISIBLE);
@@ -254,8 +255,13 @@ final class ModalPresenter extends Dialog {
                 @Override public void onReceivedHttpError(WebView view,WebResourceRequest request,WebResourceResponse response) {
                     if(request.isForMainFrame()) unavailable("Service unavailable. Tap to retry.",response.getStatusCode());
                 }
+                @Override public boolean onRenderProcessGone(WebView view,android.webkit.RenderProcessGoneDetail detail){
+                    if(web==view){web=null;content.removeView(view);view.destroy();unavailable("The web page stopped. Close this window and reopen it to retry.",-1);}return true;
+                }
             });
-            content.addView(web,new LinearLayout.LayoutParams(-1,0,1)); setContentView(content);
+            content.addView(web,new LinearLayout.LayoutParams(-1,0,1));
+            }catch(RuntimeException | LinkageError unavailable){if(web!=null){WebView broken=web;web=null;content.removeView(broken);try{broken.destroy();}catch(RuntimeException ignored){}}unavailable("Web content is unavailable on this device.",-1);}
+            setContentView(content);
             Window window=getWindow(); window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
             if(Build.VERSION.SDK_INT>=30) {
                 window.setDecorFitsSystemWindows(false);
@@ -267,11 +273,10 @@ final class ModalPresenter extends Dialog {
             } else content.setFitsSystemWindows(true);
         }
         private void unavailable(String message,int code) {
-            if(web==null) return;
-            failed=true; progress.setVisibility(View.GONE); web.setVisibility(View.GONE);
+            failed=true; progress.setVisibility(View.GONE); if(web!=null)web.setVisibility(View.GONE);
             failure.setText(message); failure.setVisibility(View.VISIBLE); Log.w("I2AHost","Web panel load failed: "+code);
         }
-        void load(Uri uri) { web.loadUrl(uri.toString()); }
+        void load(Uri uri) { if(web!=null)try{web.loadUrl(uri.toString());}catch(RuntimeException | LinkageError unavailable){unavailable("Unable to load this page.",-1);} }
         private void navigateBack() { if(web!=null && web.canGoBack()) web.goBack(); else dismiss(); }
         @Override public void onBackPressed() { navigateBack(); }
         @Override public void show() {

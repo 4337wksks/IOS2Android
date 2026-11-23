@@ -692,9 +692,6 @@ static void store_strong(Word *slot,Word value) {
     if (previous==value) return;
     metal_object_retain(value); *slot=value; metal_object_release(previous);
 }
-static Word store_weak(Word *slot,Word value) { *slot=value; return value; }
-static Word load_weak(Word *slot) { return *slot; }
-static void destroy_weak(Word *slot) { *slot=0; }
 
 /* Only ObjC atomic-property access uses these short, sharded locks. Render
  * bindings and resource retain/release never take a property lock. Protect the
@@ -2285,7 +2282,9 @@ static Word resolve_import(unsigned index) {
     if (!strcmp(name,"_SecTrustEvaluate")) return (Word)trust_evaluate;
     if (!strcmp(name,"_sysctlbyname")) return (Word)system_control;
     if (!strcmp(name,"_objc_initWeak") || !strcmp(name,"_objc_storeWeak")) return (Word)store_weak;
-    if (!strcmp(name,"_objc_loadWeak") || !strcmp(name,"_objc_loadWeakRetained")) return (Word)load_weak;
+    if (!strcmp(name,"_objc_loadWeak")) return (Word)load_weak;
+    if (!strcmp(name,"_objc_loadWeakRetained")) return (Word)load_weak_retained;
+    if (!strcmp(name,"_objc_moveWeak")) return (Word)move_weak;
     if (!strcmp(name,"_objc_destroyWeak")) return (Word)destroy_weak;
     if (!strcmp(name,"_CC_SHA1")) return (Word)guest_sha1;
     if (!strcmp(name,"_CC_SHA256")) return (Word)guest_sha256;

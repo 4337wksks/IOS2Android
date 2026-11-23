@@ -59,6 +59,22 @@ static int io_dup2(int from,int to){
     if(result>=0){bundle_fd_remove(to);if(file && bundle_fd_register(to,file)<0){int code=errno;close(to);bundle_file_release(file);errno=code;return -1;}if(file)return result;}
     if(file)bundle_file_release(file);return result;
 }
+static int bundle_temporary_descriptor(int *writer){
+    static unsigned restricted;
+    if(!__atomic_load_n(&restricted,__ATOMIC_RELAXED)){
+        int fd=(int)syscall(__NR_memfd_create,"bundle-resource",MFD_CLOEXEC);
+        if(fd>=0){char path[64];snprintf(path,sizeof(path),"/proc/self/fd/%d",fd);int reader=open(path,O_RDONLY|O_CLOEXEC);if(reader>=0){*writer=fd;return reader;}int code=errno;close(fd);errno=code;}
+        if(errno!=ENOSYS && errno!=EPERM && errno!=EACCES && errno!=ENOTSUP && errno!=ENOENT)return -1;
+        __atomic_store_n(&restricted,1,__ATOMIC_RELAXED);
+    }
+    if(!files_directory){errno=ENOENT;return -1;}
+    char *directory=NULL,*path=NULL;if(asprintf(&directory,"%s/Caches",files_directory)<0){errno=ENOMEM;return -1;}
+    if(mkdir(directory,0700) && errno!=EEXIST){int code=errno;free(directory);errno=code;return -1;}
+    if(asprintf(&path,"%s/.bundle-map-XXXXXX",directory)<0){free(directory);errno=ENOMEM;return -1;}free(directory);
+    int fd=mkstemp(path),reader=-1,code=errno;
+    if(fd>=0){fcntl(fd,F_SETFD,FD_CLOEXEC);reader=open(path,O_RDONLY|O_CLOEXEC);code=errno;if(unlink(path)){code=errno;if(reader>=0)close(reader);reader=-1;}if(reader<0)close(fd);else *writer=fd;}
+    free(path);errno=code;return reader;
+}
 static int bundle_open(const char *relative){
     if(!bundle_assets || !relative || !*relative){errno=ENOENT;return -1;}
     char *normal=bundle_normal_path(relative);if(!normal)return -1;ino_t inode=bundle_inode(normal);
@@ -66,17 +82,17 @@ static int bundle_open(const char *relative){
     AAsset *asset=AAssetManager_open(bundle_assets,name,AASSET_MODE_RANDOM);free(name);if(!asset){errno=ENOENT;return -1;}
     off64_t start=0,length=0;int fd=AAsset_openFileDescriptor64(asset,&start,&length);unsigned region=fd>=0;
     if(fd<0){
-        length=AAsset_getLength64(asset);start=0;fd=(int)syscall(__NR_memfd_create,"bundle-resource",MFD_CLOEXEC);
+        length=AAsset_getLength64(asset);start=0;int writer=-1;
+        if(length<0){AAsset_close(asset);errno=EIO;return -1;}fd=bundle_temporary_descriptor(&writer);
         if(fd>=0){size_t capacity=(uint64_t)length<65536 ? (size_t)length : 65536;unsigned char *buffer=length ? malloc(capacity) : NULL;off64_t done=0;int error=length && !buffer ? ENOMEM : 0;
             while(!error && done<length){int count=AAsset_read(asset,buffer,capacity);if(count<0 && errno==EINTR)continue;if(count<=0){error=EIO;break;}int offset=0;
-                while(offset<count){ssize_t written=write(fd,buffer+offset,(size_t)(count-offset));if(written<0 && errno==EINTR)continue;if(written<=0){error=written<0 ? errno : EIO;break;}offset+=(int)written;}
+                while(offset<count){ssize_t written=write(writer,buffer+offset,(size_t)(count-offset));if(written<0 && errno==EINTR)continue;if(written<=0){error=written<0 ? errno : EIO;break;}offset+=(int)written;}
                 done+=count;
             }
-            free(buffer);if(error){close(fd);fd=-1;errno=error;}
+            free(buffer);close(writer);if(error){close(fd);fd=-1;errno=error;}
         }
     }
     int code=errno;AAsset_close(asset);if(fd<0){errno=code;return -1;}
-    if(!region){char path[64];snprintf(path,sizeof(path),"/proc/self/fd/%d",fd);int readonly=open(path,O_RDONLY|O_CLOEXEC);code=errno;close(fd);fd=readonly;if(fd<0){errno=code==ENOENT || code==EACCES ? ENOTSUP : code;return -1;}}
     if(start<0 || length<0 || start>INT64_MAX-length){close(fd);errno=EOVERFLOW;return -1;}
     fcntl(fd,F_SETFD,FD_CLOEXEC);struct BundleFile *file=calloc(1,sizeof(*file));if(!file){close(fd);errno=ENOMEM;return -1;}
     file->start=start;file->length=length;file->inode=inode;file->references=1;file->region=region;pthread_mutex_init(&file->mutex,NULL);
@@ -122,14 +138,21 @@ static void *io_mmap(void *address,size_t length,int protection,int flags,int fd
     struct BundleFile *file=(flags&MAP_ANONYMOUS) ? NULL : bundle_fd_acquire(fd);if(!file)return mmap(address,length,protection,flags,fd,offset);
     if((flags&MAP_SHARED) && (protection&PROT_WRITE)){bundle_file_release(file);errno=EACCES;return MAP_FAILED;}
     if(!file->region){bundle_file_release(file);return mmap(address,length,protection,flags,fd,offset);}
-    if(offset<0){bundle_file_release(file);errno=EINVAL;return MAP_FAILED;}
-    long page=sysconf(_SC_PAGESIZE);uint64_t remaining=offset<file->length ? (uint64_t)(file->length-offset) : 0;
+    long page=sysconf(_SC_PAGESIZE);
+    if(page<=0 || offset<0 || offset%page || !length){bundle_file_release(file);errno=EINVAL;return MAP_FAILED;}
+    uint64_t remaining=offset<file->length ? (uint64_t)(file->length-offset) : 0;
     uint64_t rounded=(remaining+(uint64_t)page-1)/(uint64_t)page*(uint64_t)page;
     if(file->start%page || offset>=file->length || length>rounded){
-        int copy=(int)syscall(__NR_memfd_create,"bundle-mapping",MFD_CLOEXEC);if(copy<0){bundle_file_release(file);return MAP_FAILED;}
+        if((flags&MAP_PRIVATE) && remaining && length<=rounded){
+            void *result=mmap(address,length,PROT_READ|PROT_WRITE,flags|MAP_ANONYMOUS,-1,0);int code=0;size_t done=0,wanted=remaining<length ? (size_t)remaining : length;
+            if(result!=MAP_FAILED){while(done<wanted){size_t chunk=wanted-done;if(chunk>SSIZE_MAX)chunk=SSIZE_MAX;ssize_t count=pread(fd,(char *)result+done,chunk,file->start+offset+(off_t)done);if(count<0 && errno==EINTR)continue;if(count<=0){code=count<0 ? errno : EIO;break;}done+=(size_t)count;}
+                if(!code && mprotect(result,length,protection))code=errno;if(code){munmap(result,length);result=MAP_FAILED;errno=code;}}
+            bundle_file_release(file);return result;
+        }
+        int writer=-1,copy=bundle_temporary_descriptor(&writer);if(copy<0){bundle_file_release(file);return MAP_FAILED;}
         size_t capacity=(uint64_t)file->length<65536 ? (size_t)file->length : 65536;unsigned char *bytes=file->length ? malloc(capacity) : NULL;off_t done=0;int code=file->length && !bytes ? ENOMEM : 0;
-        while(!code && done<file->length){size_t wanted=(uint64_t)(file->length-done)<capacity ? (size_t)(file->length-done) : capacity;ssize_t count=pread(fd,bytes,wanted,file->start+done);if(count<0 && errno==EINTR)continue;if(count<=0){code=count<0 ? errno : EIO;break;}size_t written=0;while(written<(size_t)count){ssize_t n=write(copy,bytes+written,(size_t)count-written);if(n<0 && errno==EINTR)continue;if(n<=0){code=n<0 ? errno : EIO;break;}written+=(size_t)n;}if(code)break;done+=count;}
-        free(bytes);if(!code)fchmod(copy,0444);void *result=code ? MAP_FAILED : mmap(address,length,protection,flags,copy,offset);if(code)errno=code;int saved=errno;close(copy);bundle_file_release(file);errno=saved;return result;
+        while(!code && done<file->length){size_t wanted=(uint64_t)(file->length-done)<capacity ? (size_t)(file->length-done) : capacity;ssize_t count=pread(fd,bytes,wanted,file->start+done);if(count<0 && errno==EINTR)continue;if(count<=0){code=count<0 ? errno : EIO;break;}size_t written=0;while(written<(size_t)count){ssize_t n=write(writer,bytes+written,(size_t)count-written);if(n<0 && errno==EINTR)continue;if(n<=0){code=n<0 ? errno : EIO;break;}written+=(size_t)n;}if(code)break;done+=count;}
+        free(bytes);close(writer);void *result=code ? MAP_FAILED : mmap(address,length,protection,flags,copy,offset);if(code)errno=code;int saved=errno;close(copy);bundle_file_release(file);errno=saved;return result;
     }
     void *result=mmap(address,length,protection,flags,fd,file->start+offset);
     uint64_t tail=remaining%(uint64_t)page,tail_offset=remaining-tail;

@@ -25,14 +25,12 @@ final class PhotoLibrary {
         void read(long token,byte[] bytes,String metadata,int error);
         void authorized(long token,int status);
     }
-    private static final int STORAGE_REQUEST = 23041;
     private final Activity activity;
     private final Handler main;
     private final Executor workers;
     private final Completion completion;
     private final Events events;
     private final List<Request> pendingPermission = new ArrayList<>();
-    private boolean permissionPending;
     private volatile boolean closed;
     private static final class Request {
         final long token;
@@ -49,34 +47,21 @@ final class PhotoLibrary {
             if (!isPng(bytes)) { finish(request, 256, "UIImage has no valid PNG representation"); return; }
             if (Build.VERSION.SDK_INT <= 28 && activity.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
                 pendingPermission.add(request);
-                if (!permissionPending) {
-                    permissionPending = true;
-                    activity.requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, STORAGE_REQUEST);
-                }
+                requestNextPermission();
                 return;
             }
             submit(request);
         });
     }
     boolean permissionResult(int code, int[] results) {
-        if(code==READ_REQUEST){readPermissionPending=false;List<long[]> ready=new ArrayList<>(authorizations);authorizations.clear();for(long[] request:ready){int status=authorization((int)request[1]);if(status==0)authorize(request[0],(int)request[1]);else events.authorized(request[0],status);}return true;}
-        if (code != STORAGE_REQUEST) return false;
-        permissionPending = false;
-        List<Request> requests = new ArrayList<>(pendingPermission);
-        pendingPermission.clear();
-        boolean granted = results.length != 0 && results[0] == PackageManager.PERMISSION_GRANTED;
-        for (Request request : requests) {
-            if (granted && !closed) submit(request);
-            else finish(request, 513, "Permission to add a photo was denied");
-        }
-        return true;
+        if(code!=READ_REQUEST)return false;readPermissionPending=false;finishPermissions(permissionAccess,authorization(permissionAccess));requestNextPermission();return true;
     }
     void close() {
         closed = true;
         if(pickerRead!=null){cancelRead(pickerRead);pickerRead=null;}
         if(picker!=0){long token=picker;picker=0;events.selected(token,0,null,null);}
         for(long token:new ArrayList<>(reads.keySet()))cancel(token);
-        for(long[] request:authorizations)events.authorized(request[0],authorization((int)request[1]));authorizations.clear();
+        List<long[]> pending=new ArrayList<>(authorizations);authorizations.clear();for(long[] request:pending)events.authorized(request[0],2);
         for (Request request : pendingPermission) finish(request, 512, "Photo save activity was closed");
         pendingPermission.clear();
     }
@@ -124,6 +109,7 @@ final class PhotoLibrary {
     private long picker;
     private ReadRequest pickerRead;
     private boolean readPermissionPending;
+    private int permissionAccess;
     private final List<long[]> authorizations=new ArrayList<>();
     private final java.util.concurrent.ConcurrentHashMap<Long,ReadRequest> reads=new java.util.concurrent.ConcurrentHashMap<>();
     private static final class ReadRequest {
@@ -132,32 +118,33 @@ final class PhotoLibrary {
         volatile java.io.InputStream input;
         ReadRequest(long token,String uri,int[] options){this.token=token;this.uri=uri;this.options=options;}
     }
-    private android.content.Intent pickerIntent(){
-        android.content.Intent intent=new android.content.Intent(Build.VERSION.SDK_INT>=33 ? MediaStore.ACTION_PICK_IMAGES : android.content.Intent.ACTION_OPEN_DOCUMENT);
-        if(Build.VERSION.SDK_INT>=33){intent.setType("image/*");if(intent.resolveActivity(activity.getPackageManager())==null)intent=new android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT);}
-        intent.setType("image/*");if(android.content.Intent.ACTION_OPEN_DOCUMENT.equals(intent.getAction()))intent.addCategory(android.content.Intent.CATEGORY_OPENABLE);
-        intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION|android.content.Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);return intent;
+    private static final String[] PICK_ACTIONS={MediaStore.ACTION_PICK_IMAGES,android.content.Intent.ACTION_OPEN_DOCUMENT,android.content.Intent.ACTION_GET_CONTENT};
+    private android.content.Intent pickerIntent(String action){
+        android.content.Intent intent=new android.content.Intent(action).setType("image/*");if(!MediaStore.ACTION_PICK_IMAGES.equals(action))intent.addCategory(android.content.Intent.CATEGORY_OPENABLE);
+        intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION);if(!android.content.Intent.ACTION_GET_CONTENT.equals(action))intent.addFlags(android.content.Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);return intent;
     }
-    boolean sourceAvailable(int source){return (source==0 || source==2) && pickerIntent().resolveActivity(activity.getPackageManager())!=null;}
+    boolean sourceAvailable(int source){if(source!=0 && source!=2)return false;for(String action:PICK_ACTIONS)try{if(pickerIntent(action).resolveActivity(activity.getPackageManager())!=null)return true;}catch(RuntimeException unavailable){}return false;}
     void pick(long token){main.post(()->{
         if(closed || picker!=0 || activity.isFinishing() || activity.isDestroyed()){events.selected(token,-1,"The photo picker is unavailable.",null);return;}
         picker=token;
-        try{activity.startActivityForResult(pickerIntent(),PICK_REQUEST);events.selected(token,2,null,null);}
-        catch(RuntimeException failure){picker=0;events.selected(token,-1,"No Android photo picker is available.",null);}
+        for(String action:PICK_ACTIONS){try{activity.startActivityForResult(pickerIntent(action),PICK_REQUEST);events.selected(token,2,null,null);return;}
+            catch(android.content.ActivityNotFoundException|SecurityException unavailable){}}
+        picker=0;events.selected(token,-1,"No Android photo picker is available.",null);
     });}
-    void dismiss(long token){main.post(()->{if(picker==token){picker=0;if(pickerRead!=null){cancelRead(pickerRead);pickerRead=null;}activity.finishActivity(PICK_REQUEST);}});}
+    void dismiss(long token){main.post(()->{if(picker==token){picker=0;if(pickerRead!=null){cancelRead(pickerRead);pickerRead=null;}try{activity.finishActivity(PICK_REQUEST);}catch(RuntimeException unavailable){}}});}
     boolean result(int request,int result,android.content.Intent data){
         if(request!=PICK_REQUEST)return false;long token=picker;if(token==0)return true;
         Uri uri=result==Activity.RESULT_OK && data!=null ? data.getData() : null;
+        if(uri==null && result==Activity.RESULT_OK && data!=null && data.getClipData()!=null && data.getClipData().getItemCount()>0)uri=data.getClipData().getItemAt(0).getUri();
         if(uri==null){picker=0;events.selected(token,0,null,null);return true;}
-        try{activity.getContentResolver().takePersistableUriPermission(uri,android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION);}catch(SecurityException ignored){}
+        if((data.getFlags()&android.content.Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)!=0)try{activity.getContentResolver().takePersistableUriPermission(uri,android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION);}catch(SecurityException|IllegalArgumentException ignored){}
         ReadRequest selected=new ReadRequest(token,uri.toString(),new int[]{1,1,0,0,0,0,0});pickerRead=selected;
         try{workers.execute(()->{
             byte[] bytes=null;String metadata=null;int outcome=1;
             try{Object[] value=readNow(selected);bytes=(byte[])value[0];metadata=(String)value[1];if((int)value[2]!=0){outcome=-1;metadata="Android could not read the selected image.";}}
             catch(RuntimeException failure){outcome=-1;metadata="Android could not read the selected image.";}
             byte[] image=bytes;String info=metadata;int status=outcome;main.post(()->{if(picker!=token)return;picker=0;pickerRead=null;events.selected(token,status,info,image);});
-        });}catch(java.util.concurrent.RejectedExecutionException failure){picker=0;events.selected(token,-1,"The photo worker is unavailable.",null);}
+        });}catch(java.util.concurrent.RejectedExecutionException failure){picker=0;pickerRead=null;events.selected(token,-1,"The photo worker is unavailable.",null);}
         return true;
     }
     int authorization(int access){
@@ -168,27 +155,38 @@ final class PhotoLibrary {
         return activity.getPreferences(Activity.MODE_PRIVATE).getBoolean("photo.permission."+access,false) ? 2 : 0;
     }
     void authorize(long token,int access){main.post(()->{
-        int status=authorization(access);if(status==3 || status==4 || closed){events.authorized(token,status);return;}
+        if(closed || activity.isFinishing() || activity.isDestroyed()){events.authorized(token,2);return;}
+        int status=authorization(access);if(status==3 || status==4){events.authorized(token,status);return;}authorizations.add(new long[]{token,access});requestNextPermission();
+    });}
+    private void finishPermissions(int access,int status){
+        List<long[]> ready=new ArrayList<>();for(java.util.Iterator<long[]> iterator=authorizations.iterator();iterator.hasNext();){long[] request=iterator.next();if(request[1]==access){iterator.remove();ready.add(request);}}
+        if(access==1){List<Request> writes=new ArrayList<>(pendingPermission);pendingPermission.clear();for(Request request:writes){if(status==3 && !closed)submit(request);else finish(request,513,"Permission to add a photo was denied");}}
+        for(long[] request:ready)events.authorized(request[0],status==0 ? 2 : status);
+    }
+    private void requestNextPermission(){
+        if(readPermissionPending || closed || (pendingPermission.isEmpty() && authorizations.isEmpty()))return;
+        int access=!pendingPermission.isEmpty() ? 1 : (int)authorizations.get(0)[1];int status=authorization(access);
+        if(status==3 || status==4){finishPermissions(access,status);requestNextPermission();return;}
         String permission=access==1 ? Manifest.permission.WRITE_EXTERNAL_STORAGE : Build.VERSION.SDK_INT>=33 ? Manifest.permission.READ_MEDIA_IMAGES : Manifest.permission.READ_EXTERNAL_STORAGE;
         try{String[] declared=activity.getPackageManager().getPackageInfo(activity.getPackageName(),PackageManager.GET_PERMISSIONS).requestedPermissions;
-            if(declared==null || !java.util.Arrays.asList(declared).contains(permission)){events.authorized(token,2);return;}
-        }catch(PackageManager.NameNotFoundException missing){events.authorized(token,2);return;}
-        authorizations.add(new long[]{token,access});if(readPermissionPending)return;readPermissionPending=true;
+            if(declared==null || !java.util.Arrays.asList(declared).contains(permission)){finishPermissions(access,2);requestNextPermission();return;}
+        }catch(PackageManager.NameNotFoundException missing){finishPermissions(access,2);requestNextPermission();return;}
+        permissionAccess=access;readPermissionPending=true;
         activity.getPreferences(Activity.MODE_PRIVATE).edit().putBoolean("photo.permission."+access,true).apply();
         String[] requested=access!=1 && Build.VERSION.SDK_INT>=34 ? new String[]{permission,Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED} : new String[]{permission};
-        try{activity.requestPermissions(requested,READ_REQUEST);}catch(RuntimeException failure){readPermissionPending=false;for(long[] pending:authorizations)events.authorized(pending[0],2);authorizations.clear();}
-    });}
+        try{activity.requestPermissions(requested,READ_REQUEST);}catch(RuntimeException failure){readPermissionPending=false;finishPermissions(access,2);requestNextPermission();}
+    }
     private static void field(org.json.JSONObject record,String key,Object value){try{record.put(key,value);}catch(org.json.JSONException failure){throw new IllegalArgumentException(failure);}}
     private org.json.JSONObject metadata(Uri uri) throws IOException {
         if(!"content".equals(uri.getScheme()))throw new IOException("Unsupported photo URI");
-        ContentResolver resolver=activity.getContentResolver();String mime=resolver.getType(uri);if(mime==null || !mime.startsWith("image/"))throw new IOException("Not an image");
+        ContentResolver resolver=activity.getContentResolver();String mime=resolver.getType(uri);if(mime!=null && !mime.startsWith("image/") && !mime.equals("application/octet-stream"))throw new IOException("Not an image");
         org.json.JSONObject record=new org.json.JSONObject();field(record,"uri",uri.toString());field(record,"mime",mime);
         try(android.database.Cursor cursor=resolver.query(uri,null,null,null,null)){
             if(cursor!=null && cursor.moveToFirst()){
                 String[] columns={"width","height","datetaken","date_modified","_size","_display_name","is_favorite"};String[] keys={"width","height","date","modified","size","name","favorite"};
                 for(int i=0;i<columns.length;i++){int index=cursor.getColumnIndex(columns[i]);if(index>=0 && !cursor.isNull(index))field(record,keys[i],i==5 ? cursor.getString(index) : cursor.getLong(index));}
             }
-        }
+        }catch(IllegalArgumentException|UnsupportedOperationException unavailable){}
         return record;
     }
     String[] assets(String[] identifiers,int limit){
@@ -235,7 +233,8 @@ final class PhotoLibrary {
             int orientation=1;try{orientation=new android.media.ExifInterface(new java.io.ByteArrayInputStream(bytes)).getAttributeInt(android.media.ExifInterface.TAG_ORIENTATION,1);}catch(IOException ignored){}
             if(orientation<1 || orientation>8)orientation=1;field(record,"orientation",orientation);
             android.graphics.BitmapFactory.Options bounds=new android.graphics.BitmapFactory.Options();bounds.inJustDecodeBounds=true;android.graphics.BitmapFactory.decodeByteArray(bytes,0,bytes.length,bounds);
-            if(bounds.outWidth>0 && bounds.outHeight>0){field(record,"width",bounds.outWidth);field(record,"height",bounds.outHeight);}
+            if((bounds.outWidth<=0 || bounds.outHeight<=0) && !record.optString("mime").startsWith("image/"))throw new IOException("Unsupported image format");
+            if(bounds.outWidth>0 && bounds.outHeight>0){field(record,"width",bounds.outWidth);field(record,"height",bounds.outHeight);if(bounds.outMimeType!=null)field(record,"mime",bounds.outMimeType);}
             if(o[0]!=0){
                 if(bounds.outWidth<=0 || bounds.outHeight<=0)throw new IOException("Unsupported image format");
                 android.graphics.BitmapFactory.Options decode=new android.graphics.BitmapFactory.Options();int targetWidth=o[3],targetHeight=o[4];

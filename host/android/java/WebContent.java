@@ -110,8 +110,8 @@ final class WebContent {
                 if(action.equals("back") || action.equals("forward")) {
                     if(page.web!=null){if(action.equals("back") && page.web.canGoBack())page.web.goBack();else if(action.equals("forward") && page.web.canGoForward())page.web.goForward();}return;
                 }
-                if(page.configurationFailed){page.fail(-1,"The web view configuration is unavailable.",page.url);return;}
                 if(page.web==null){page.createWeb();page.configure(page.settings);}
+                if(page.configurationFailed){page.fail(-1,"The web view configuration is unavailable.",page.url);return;}
                 if(!page.configured)page.configure(new JSONObject());
                 page.started=false;page.loading=true;page.failed=false;page.error.setVisibility(View.GONE);page.web.setVisibility(View.VISIBLE);page.web.stopLoading();
                 if(action.equals("html") || action.equals("data")) {
@@ -131,7 +131,7 @@ final class WebContent {
                     if(values!=null)for(java.util.Iterator<String> keys=values.keys();keys.hasNext();) { String key=keys.next();headers.put(key,values.getString(key)); }
                     page.web.loadUrl(url,headers);
                 } else page.fail(-1000,"This navigation method is unavailable.",url);
-            } catch(Exception failure) { page.fail(-1,"Unable to load this page.",page.url); }
+            } catch(Exception | LinkageError failure) { page.fail(-1,"Unable to load this page.",page.url); }
     }
     void close() { closed=true;for(Page page:pages.values())page.destroy();pages.clear(); }
 
@@ -159,12 +159,13 @@ final class WebContent {
             this.token=token;panel=new FrameLayout(activity);
             error=new TextView(activity);error.setText("Unable to load this page. Tap to retry.");error.setGravity(android.view.Gravity.CENTER);error.setTextColor(new ModalPresenter.Palette(activity).foreground);
             error.setBackgroundColor(new ModalPresenter.Palette(activity).surface);error.setVisibility(View.GONE);error.setOnClickListener(view->event(this,0,0,fields("url",url,"type",3)));
-            createWeb();panel.addView(error,new FrameLayout.LayoutParams(-1,-1));
+            panel.addView(error,new FrameLayout.LayoutParams(-1,-1));
         }
         void createWeb() {
+            try{
             web=new DocumentView();
             web.getSettings().setAllowFileAccess(false);web.getSettings().setAllowContentAccess(false);web.getSettings().setDomStorageEnabled(true);
-            if(Build.VERSION.SDK_INT>=33)web.getSettings().setAlgorithmicDarkeningAllowed(new ModalPresenter.Palette(activity).dark);
+            if(Build.VERSION.SDK_INT>=33)try{web.getSettings().setAlgorithmicDarkeningAllowed(new ModalPresenter.Palette(activity).dark);}catch(UnsupportedOperationException | LinkageError unavailable){}
             web.setEnabled(enabled);web.setBackgroundColor(background);applyScroll();applyViewport();
             panel.addView(web,0,new FrameLayout.LayoutParams(-1,-1));
             web.setWebViewClient(new WebViewClient() {
@@ -202,6 +203,7 @@ final class WebContent {
                 @Override public void onCloseWindow(WebView view) { event(Page.this,10,0,new JSONObject()); }
             });
             web.setOnScrollChangeListener((view,x,y,oldX,oldY)->snapshot());
+            }catch(RuntimeException | LinkageError unavailable){if(web!=null){DocumentView failed=web;web=null;panel.removeView(failed);try{failed.destroy();}catch(RuntimeException ignored){}}throw unavailable;}
         }
         void applyScroll(){float density=activity.getResources().getDisplayMetrics().density;web.setVerticalScrollBarEnabled(vertical);web.setHorizontalScrollBarEnabled(horizontal);web.setPadding(Math.round(left*density),Math.round(top*density),Math.round(right*density),Math.round(bottom*density));}
         void applyViewport(){web.getSettings().setUseWideViewPort(scales);web.getSettings().setLoadWithOverviewMode(scales);}

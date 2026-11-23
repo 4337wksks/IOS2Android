@@ -64,12 +64,15 @@ External adapters supply application patches, resource replacements, service con
 
 Online services reuse portable endpoints and configuration from the original application where available. iOS account, payment, push, and third-party platform identifiers cannot be used directly on Android. Without compatible configuration, the runtime reports failure or unavailability. Helpshift can use its web backend when a valid domain is available.
 
-Resources are normally read from the installed APK; interfaces that require a real file path extract individual files. Startup removes resource copies left by older runtime versions. Shaders and driver compilation results are cached in private storage. Updates remove old caches even when the application version stays the same. Unavailable caches are regenerated.
+Resources are normally read from the installed APK. A real-path requirement or unavailable shared-memory support is handled per file; temporary mapping files are released when no longer in use. Startup removes resource copies left by older runtime versions. Shaders and driver compilation results are cached in private storage. Updates remove old caches even when the application version stays the same. Unavailable caches are regenerated.
 
 APKs are written to `out/<application-id>/<CFBundleVersion>/dev|release/` in the external workspace. Build different input versions sequentially when sharing a cache. Use separate workspaces for parallel builds.
 
 ### Compatibility
 
+The runtime targets ARM64 Android 9 and later. Window, picker, and permission APIs are selected according to platform capabilities. GPU drivers, WebView, photo providers, and location services still affect feature availability. Validation does not cover every Android version or vendor ROM.
+
+- General Foundation/UIKit object destruction remains incomplete. Automatic weak-reference clearing currently covers only objects whose lifetimes are managed by the runtime.
 - Encrypted binaries and chained fixups are not supported. Dynamic library and symbol loading also have coverage limits.
 - Scene lifecycle, complex NIBs, layout, animation, general scrolling, and text editing still have compatibility gaps; not every native interface can be rendered.
 - Tables still lack constraint-based automatic row heights, NIB cells, editing/reordering, insertion/deletion animations, and complete grouped styling. Offscreen row geometry may use estimated heights.
