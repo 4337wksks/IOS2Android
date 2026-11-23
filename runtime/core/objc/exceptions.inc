@@ -148,7 +148,16 @@ __attribute__((used,noinline,noreturn)) static void exception_raise_format(Word 
     guest_exception_throw(exception_create(cls,selector,name,reason,0));
 }
 __attribute__((naked)) static void exception_raise_varargs(void) { __asm__ volatile("mov x4,sp\n b exception_raise_format"); }
+static __attribute__((noreturn)) void object_unrecognized(Word object,const char *selector,const char *missing) {
+    int type=host_symbol(object)!=NULL || guest_class_object(object);
+    const char *name=class_name(type ? object : read_word(object));if(name && !strncmp(name,"_OBJC_CLASS_$_",14))name+=14;
+    char *message=NULL;
+    if(asprintf(&message,"%c[%s %s]: unrecognized selector sent to %s 0x%lx",type ? '+' : '-',name ? name : "NSObject",missing ? missing : "(null)",type ? "class" : "instance",object)<0)stop("Allocation failed",selector);
+    Word reason=copy_string(message);free(message);
+    guest_exception_throw(exception_create(external_class("_OBJC_CLASS_$_NSException"),selector,copy_string("NSInvalidArgumentException"),reason,0));
+}
 static Method exceptions_method(Word object,const char *selector,const char *receiver,int class_receiver) {
+    if(receiver && !strcmp(selector,"doesNotRecognizeSelector:"))return (Method)object_unrecognized;
     if (!receiver || strcmp(receiver,"_OBJC_CLASS_$_NSException")) return NULL;
     if (class_receiver) {
         if (!strcmp(selector,"exceptionWithName:reason:userInfo:")) return (Method)exception_create;

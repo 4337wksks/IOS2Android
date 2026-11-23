@@ -54,10 +54,6 @@ static void metal_snapshot_return(struct MetalTexture *texture) {
     ++metal_snapshot_cache_count; metal_snapshot_cache_bytes+=texture->allocation;
     pthread_mutex_unlock(&metal_snapshot_cache_mutex);
 }
-static unsigned metal_descriptor_kind_index(VkDescriptorType type) {
-    return type==VK_DESCRIPTOR_TYPE_SAMPLER ? 0 : type==VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ? 1 : type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? 2 :
-        type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ? 4 : type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC ? 5 : 3;
-}
 static struct MetalDescriptorPoolChunk *metal_descriptor_pool_acquire(const unsigned counts[6]) {
     pthread_mutex_lock(&metal_descriptor_pool_cache_mutex);
     struct MetalDescriptorPoolChunk **slot=&metal_descriptor_pool_cache;
@@ -504,22 +500,23 @@ static void metal_render_descriptors(struct MetalRenderEncoder *encoder) {
     VkDescriptorSet sets[2];
     if (snapshot) memcpy(sets,snapshot->sets,sizeof(sets));
     else {
-        unsigned counts[6]={0};
-        for (unsigned stage_index=0;stage_index<2;++stage_index) {
-            struct MetalFunction *function=stage_index ? pipeline->fragment : pipeline->vertex;
-            for (unsigned i=0;function && i<function->spec->binding_count;++i)
-                ++counts[metal_descriptor_kind_index(metal_pipeline_binding_type(pipeline,shader_bindings[function->spec->first_binding+i].type))];
-        }
+        const unsigned *counts=pipeline->descriptor_counts;
         struct MetalDescriptorPoolChunk *chunk=encoder->state->pools;
-        int fits=chunk && chunk->sets<64;
-        for (unsigned i=0;i<COUNT(counts);++i) if (chunk && counts[i]>chunk->per_draw[i]) fits=0;
+        int fits=chunk && chunk->sets<=62 && !memcmp(counts,chunk->per_draw,sizeof(chunk->per_draw));
         if (!fits) {
             chunk=metal_descriptor_pool_acquire(counts); if (!chunk) metal_render_stop("Allocation failed","Render descriptor pool");
             chunk->next=encoder->state->pools; encoder->state->pools=chunk;
         }
         VkDescriptorSetAllocateInfo allocate={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=chunk->pool,
             .descriptorSetCount=2,.pSetLayouts=pipeline->sets};
-        metal_render_result(VKD(vkAllocateDescriptorSets)(vulkan.device,&allocate,sets),"vkAllocateDescriptorSets"); chunk->sets+=2;
+        VkResult result=VKD(vkAllocateDescriptorSets)(vulkan.device,&allocate,sets);
+        if ((result==VK_ERROR_OUT_OF_POOL_MEMORY || result==VK_ERROR_FRAGMENTED_POOL) && chunk->sets) {
+            chunk->sets=64;
+            chunk=metal_descriptor_pool_acquire(counts);if(!chunk)metal_render_stop("Allocation failed","Render descriptor pool");
+            chunk->next=encoder->state->pools;encoder->state->pools=chunk;allocate.descriptorPool=chunk->pool;
+            result=VKD(vkAllocateDescriptorSets)(vulkan.device,&allocate,sets);
+        }
+        metal_render_result(result,"vkAllocateDescriptorSets"); chunk->sets+=2;
         for (unsigned i=0;i<write_count;++i) writes[i].dstSet=sets[stages[i]];
         if (write_count) VKD(vkUpdateDescriptorSets)(vulkan.device,write_count,writes,0,NULL);
         if (encoder->state->descriptor_count<128) {

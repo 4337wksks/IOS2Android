@@ -49,8 +49,72 @@ final class HttpTransport {
     private final FailureSink failures;
     private final ConcurrentHashMap<Long, Job> jobs = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, java.util.concurrent.Semaphore> hostLimits = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<Long, java.net.CookieManager> cookieStores = new ConcurrentHashMap<>();
-    private final java.util.concurrent.ScheduledExecutorService resourceDeadlines = java.util.concurrent.Executors.newSingleThreadScheduledExecutor();
+    private final ConcurrentHashMap<Long, CookieJar> cookieStores = new ConcurrentHashMap<>();
+    private static final class CookieJar {
+        final java.net.CookieManager manager=new java.net.CookieManager(null,java.net.CookiePolicy.ACCEPT_ORIGINAL_SERVER);
+        final Map<String,Long> expires=new java.util.HashMap<>();
+        volatile int policy=2;
+        private static String key(java.net.HttpCookie cookie) { return cookie.getDomain()+"\n"+cookie.getPath()+"\n"+cookie.getName(); }
+        private void remember(java.net.HttpCookie cookie) {
+            long age=cookie.getMaxAge(),now=System.currentTimeMillis();
+            if(age<0)expires.remove(key(cookie));
+            else expires.put(key(cookie),age>(Long.MAX_VALUE-now)/1000 ? Long.MAX_VALUE : now+age*1000);
+        }
+        synchronized void put(java.net.URI uri,Map<String,List<String>> headers,int acceptance) throws IOException {
+            if(acceptance==1 || policy==1)return;
+            manager.setCookiePolicy(acceptance==0 && policy==0 ? java.net.CookiePolicy.ACCEPT_ALL : java.net.CookiePolicy.ACCEPT_ORIGINAL_SERVER);
+            manager.put(uri,headers);
+            for(Map.Entry<String,List<String>> entry:headers.entrySet())if(entry.getKey()!=null && (entry.getKey().equalsIgnoreCase("Set-Cookie") || entry.getKey().equalsIgnoreCase("Set-Cookie2")))
+                for(String header:entry.getValue())try{for(java.net.HttpCookie cookie:java.net.HttpCookie.parse(header)){
+                    if(cookie.getDomain()==null)cookie.setDomain(uri.getHost());
+                    if(cookie.getPath()==null){String path=uri.getPath();int slash=path==null ? -1 : path.lastIndexOf('/');cookie.setPath(slash>0 ? path.substring(0,slash) : "/");}
+                    remember(cookie);
+                }}catch(IllegalArgumentException ignored){}
+        }
+        synchronized org.json.JSONArray snapshot(java.net.URI uri) throws org.json.JSONException {
+            org.json.JSONArray result=new org.json.JSONArray();java.util.Set<String> active=new java.util.HashSet<>();
+            for(java.net.HttpCookie cookie:manager.getCookieStore().getCookies()){
+                active.add(key(cookie));
+                if(cookie.hasExpired())continue;
+                if(uri!=null){String path=uri.getPath();if(path==null || path.isEmpty())path="/";String root=cookie.getPath()==null ? "/" : cookie.getPath();
+                    String domain=cookie.getDomain(),host=uri.getHost();if(domain==null || host==null)continue;
+                    if(!host.equalsIgnoreCase(domain) && !java.net.HttpCookie.domainMatches(domain,host))continue;
+                    if(!path.startsWith(root) || path.length()>root.length() && !root.endsWith("/") && path.charAt(root.length())!='/')continue;
+                    if(cookie.getSecure() && !"https".equalsIgnoreCase(uri.getScheme()))continue;
+                }
+                org.json.JSONObject properties=new org.json.JSONObject();
+                properties.put("Name",cookie.getName());properties.put("Value",cookie.getValue());properties.put("Domain",cookie.getDomain());properties.put("Path",cookie.getPath()==null ? "/" : cookie.getPath());
+                properties.put("Secure",cookie.getSecure());properties.put("HttpOnly",cookie.isHttpOnly());properties.put("Version",cookie.getVersion());
+                Long expiration=expires.get(key(cookie));if(expiration!=null)properties.put("Expires",expiration/1000.0);
+                result.put(properties);
+            }
+            expires.keySet().retainAll(active);return result;
+        }
+        synchronized void set(org.json.JSONObject properties,boolean remove) throws Exception {
+            java.net.HttpCookie cookie=new java.net.HttpCookie(properties.getString("Name"),properties.getString("Value"));
+            cookie.setDomain(properties.getString("Domain"));cookie.setPath(properties.optString("Path","/"));
+            java.net.URI uri=new java.net.URI((properties.optBoolean("Secure") ? "https" : "http")+"://"+cookie.getDomain().replaceFirst("^\\.",""));
+            if(remove){manager.getCookieStore().remove(uri,cookie);expires.remove(key(cookie));return;}
+            if(policy==1)return;
+            cookie.setVersion(properties.optInt("Version",0));cookie.setSecure(properties.optBoolean("Secure"));cookie.setHttpOnly(properties.optBoolean("HttpOnly"));
+            if(properties.has("Expires")){long expiration=(long)(properties.getDouble("Expires")*1000);expires.put(key(cookie),expiration);cookie.setMaxAge(Math.max(0,(expiration-System.currentTimeMillis()+999)/1000));}
+            else expires.remove(key(cookie));
+            manager.getCookieStore().add(uri,cookie);
+        }
+    }
+    String cookieCommand(long token,String operation,String json) throws Exception {
+        CookieJar jar=cookieStores.computeIfAbsent(token,ignored->new CookieJar());
+        org.json.JSONObject input=new org.json.JSONObject(json);
+        if(operation.equals("cookies") || operation.equals("url"))return jar.snapshot(operation.equals("url") ? new java.net.URI(input.getString("url")) : null).toString();
+        if(operation.equals("policy")){jar.policy=input.getInt("policy");return "{}";}
+        if(operation.equals("set") || operation.equals("delete")){jar.set(input,operation.equals("delete"));return "{}";}
+        if(operation.equals("response")){
+            Map<String,List<String>> headers=new java.util.HashMap<>();org.json.JSONObject fields=input.getJSONObject("headers");
+            java.util.Iterator<String> keys=fields.keys();while(keys.hasNext()){String key=keys.next();headers.put(key,java.util.Collections.singletonList(fields.getString(key)));}
+            jar.put(new java.net.URI(input.getString("url")),headers,jar.policy);return "{}";
+        }
+        throw new IllegalArgumentException("Unknown cookie operation");
+    }
     private static final class Cancelled extends IOException {}
     private static final class TransportError extends IOException {
         final int code;
@@ -65,6 +129,8 @@ final class HttpTransport {
         volatile CompletableFuture<Integer> decision;
         volatile boolean suspended;
         volatile boolean resourceExpired;
+        volatile FutureTask<?> callback;
+        Thread permitWaiter;
         long[] settings;
         int timeout = 60_000;
         Job(long token) { this(token, false); }
@@ -84,15 +150,17 @@ final class HttpTransport {
     void sendSynchronously(long token) {
         Job job = new Job(token, true);
         if (jobs.putIfAbsent(token, job) != null) throw new IllegalStateException("Duplicate synchronous connection");
-        // A synchronous caller may be the Android UI thread. Its callbacks must
-         
+        job.settings=settings(token);
         FutureTask<Void> task = new FutureTask<>(() -> { run(job); return null; });
         try { workers.execute(task); }
         catch (RuntimeException failure) { jobs.remove(token, job); throw failure; }
         boolean interrupted = false;
+        boolean timed=job.settings[2]>0;
+        long deadline=timed ? System.nanoTime()+TimeUnit.MILLISECONDS.toNanos(Math.min(job.settings[2],Long.MAX_VALUE/1_000_000)) : 0;
         try {
             for (;;) {
-                try { task.get(); return; }
+                try { if(timed)task.get(Math.max(1,deadline-System.nanoTime()),TimeUnit.NANOSECONDS);else task.get();return; }
+                catch(TimeoutException timeout){expire(job);timed=false;}
                 catch (InterruptedException waiting) { interrupted = true; }
                 catch (ExecutionException failure) { throw new IllegalStateException("Synchronous connection failed", failure.getCause()); }
             }
@@ -100,6 +168,15 @@ final class HttpTransport {
 
             if (interrupted) Thread.currentThread().interrupt();
         }
+    }
+    private void expire(Job job) {
+        job.resourceExpired=true;
+        FutureTask<?> callback=job.callback;if(callback!=null)callback.cancel(false);
+        synchronized(job){job.suspended=false;if(job.permitWaiter!=null)job.permitWaiter.interrupt();job.notifyAll();}
+        SocketTimeoutException failure=new SocketTimeoutException("URLSession resource timeout");
+        if(job.decision!=null)job.decision.completeExceptionally(failure);
+        if(job.authentication!=null)job.authentication.completeExceptionally(failure);
+        HttpURLConnection connection=job.connection;if(connection!=null)workers.execute(connection::disconnect);
     }
 
     void cancel(long token) {
@@ -109,7 +186,8 @@ final class HttpTransport {
         CompletableFuture<Integer> decision = job.authentication;
         if (decision != null) decision.complete(2);
         if (job.decision != null) job.decision.complete(0);
-        synchronized (job) { job.notifyAll(); }
+        FutureTask<?> callback=job.callback;if(callback!=null)callback.cancel(false);
+        synchronized (job) { if(job.permitWaiter!=null)job.permitWaiter.interrupt();job.notifyAll(); }
         HttpURLConnection connection = job.connection;
         if (connection != null) workers.execute(connection::disconnect);
     }
@@ -144,20 +222,21 @@ final class HttpTransport {
         awaitRunning(job);
         if (job.synchronous) return action.call();
         FutureTask<T> task = new FutureTask<>(action);
-        if (!dispatchCallback(job.token,task) && !main.post(task)) throw new IOException("Android main Looper is unavailable");
-        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(job.timeout);
-        while (true) {
-            if (job.cancelled) { task.cancel(false); throw new Cancelled(); }
-            try { return task.get(100, TimeUnit.MILLISECONDS); }
-            catch (TimeoutException waiting) {
-                if (System.nanoTime() >= deadline) { task.cancel(false); throw new SocketTimeoutException("Waiting for connection delegate"); }
-            } catch (ExecutionException failure) {
+        job.callback=task;
+        try {
+            awaitRunning(job);
+            if (!dispatchCallback(job.token,task) && !main.post(task)) throw new IOException("Android main Looper is unavailable");
+            return task.get(job.timeout,TimeUnit.MILLISECONDS);
+        } catch (TimeoutException waiting) {
+            throw new SocketTimeoutException("Waiting for connection delegate");
+        } catch (java.util.concurrent.CancellationException cancelled) {
+            awaitRunning(job);throw new IOException("Connection callback cancelled");
+        } catch (ExecutionException failure) {
                 Throwable cause = failure.getCause();
                 if (cause instanceof Exception) throw (Exception) cause;
                 if (cause instanceof Error) throw (Error) cause;
                 throw new IOException(cause);
-            }
-        }
+        } finally { job.callback=null;task.cancel(false); }
     }
 
     private static X509TrustManager systemTrust() throws Exception {
@@ -207,18 +286,13 @@ final class HttpTransport {
     }
 
     private void run(Job job) {
-        java.util.concurrent.ScheduledFuture<?> expiration = null;
+        Runnable expiration = null;
         try {
-            job.settings = settings(job.token);
-            if (job.settings[2] > 0) expiration = resourceDeadlines.schedule(() -> {
-                job.resourceExpired = true;
-                synchronized (job) { job.suspended = false; job.notifyAll(); }
-                SocketTimeoutException failure = new SocketTimeoutException("URLSession resource timeout");
-                if (job.decision != null) job.decision.completeExceptionally(failure);
-                if (job.authentication != null) job.authentication.completeExceptionally(failure);
-                HttpURLConnection connection = job.connection;
-                if (connection != null) workers.execute(connection::disconnect);
-            }, job.settings[2], TimeUnit.MILLISECONDS);
+            if(job.settings==null)job.settings = settings(job.token);
+            if (job.settings[2] > 0) {
+                expiration=() -> expire(job);
+                if(!main.postDelayed(expiration,job.settings[2]))throw new IOException("Android main Looper is unavailable");
+            }
             if (!decision(job, () -> redirect(job.token, null, 0, null, null))) return;
             for (int redirects = 0; ; redirects++) {
                 awaitRunning(job);
@@ -231,8 +305,12 @@ final class HttpTransport {
                 String origin = url.getProtocol() + "://" + url.getHost().toLowerCase(java.util.Locale.ROOT) + ":" + url.getPort();
                 java.util.concurrent.Semaphore permits = hostLimits.computeIfAbsent(job.settings[0] + ":" + origin,
                     ignored -> new java.util.concurrent.Semaphore((int) Math.max(1, Math.min(1024, job.settings[1])), true));
-                while (!permits.tryAcquire(100, TimeUnit.MILLISECONDS)) awaitRunning(job);
+                synchronized(job){if(job.cancelled)throw new Cancelled();job.permitWaiter=Thread.currentThread();}
+                try { permits.acquire(); }
+                catch(InterruptedException interrupted){awaitRunning(job);Thread.currentThread().interrupt();throw new IOException("Connection limit wait interrupted",interrupted);}
+                finally { synchronized(job){job.permitWaiter=null;} }
                 try {
+                awaitRunning(job);
                 HttpURLConnection connection = (HttpURLConnection) url.openConnection();
                 job.connection = connection;
                 connection.setInstanceFollowRedirects(false);
@@ -241,9 +319,8 @@ final class HttpTransport {
                 connection.setRequestMethod(info[1]);
                 connection.setUseCaches(info[3].equals("0"));
                 for (int i = 6; i + 1 < info.length; i += 2) connection.setRequestProperty(info[i], info[i + 1]);
-                java.net.CookieManager cookies = job.settings[3] == 0 || info[5].equals("0") ? null : cookieStores.computeIfAbsent(job.settings[0],
-                    ignored -> new java.net.CookieManager(null, java.net.CookiePolicy.ACCEPT_ORIGINAL_SERVER));
-                if (cookies != null) for (Map.Entry<String, List<String>> field : cookies.get(url.toURI(), connection.getRequestProperties()).entrySet())
+                CookieJar cookies = job.settings[3] == 0 || info[5].equals("0") || job.settings[4]==0 ? null : cookieStores.computeIfAbsent(job.settings[4],ignored->new CookieJar());
+                if (cookies != null) for (Map.Entry<String, List<String>> field : cookies.manager.get(url.toURI(), connection.getRequestProperties()).entrySet())
                     if (connection.getRequestProperty(field.getKey()) == null) connection.setRequestProperty(field.getKey(), String.join("; ", field.getValue()));
                 if (!job.synchronous && connection instanceof HttpsURLConnection) configureTLS(job, (HttpsURLConnection) connection);
                 // DEVELOPMENT_BEGIN
@@ -269,7 +346,7 @@ final class HttpTransport {
                         }
                     }
                     int code = connection.getResponseCode();
-                    if (cookies != null) cookies.put(url.toURI(), connection.getHeaderFields());
+                    if (cookies != null) cookies.put(url.toURI(), connection.getHeaderFields(),(int)job.settings[5]);
                     String[] fields = headers(connection);
                     String location = connection.getHeaderField("Location");
                     if (location != null && (code == 301 || code == 302 || code == 303 || code == 307 || code == 308)) {
@@ -321,7 +398,7 @@ final class HttpTransport {
                     int code = job.resourceExpired ? -1001 : failure instanceof TransportError ? ((TransportError) failure).code :
                         failure instanceof SocketTimeoutException ? -1001 : failure instanceof UnknownHostException ? -1003 :
                         failure instanceof ConnectException ? -1004 : failure instanceof SSLException ? -1200 : -1005;
-                    if (expiration != null) expiration.cancel(false);
+                    if (expiration != null) main.removeCallbacks(expiration);
                     job.resourceExpired = false;
                     try { onMain(job, () -> { complete(job.token, code, failure.toString()); return null; }); }
                     catch (Exception callbackFailure) {
@@ -330,6 +407,6 @@ final class HttpTransport {
                     }
                 }
             }
-        } finally { if (expiration != null) expiration.cancel(false); jobs.remove(job.token); }
+        } finally { if (expiration != null) main.removeCallbacks(expiration); jobs.remove(job.token); }
     }
 }

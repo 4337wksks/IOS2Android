@@ -62,17 +62,18 @@ static Word file_url_set_resources(struct HostObject *url,const char *selector,s
     return 1;
 }
 static Word string_file_url(Word cls,const char *selector,struct HostObject *url,Word encoding,Word *error) {
-    if (!url || !url->content[1]) return file_failure(error,"Non-file URL",ENOTSUP);
-    Word data=data_url(external_class("_OBJC_CLASS_$_NSData"),selector,url);
-    if (!data) return file_failure(error,string_bytes(url_path(url),selector),errno);
+    if (!url) return file_failure(error,"Nil URL",EINVAL);
+    Word data=data_url_options(external_class("_OBJC_CLASS_$_NSData"),selector,url,0,error);
+    if (!data) return 0;
     Word result=string_from_data(cls,selector,(void *)data,encoding);
     free((void *)data);
+    if(!result && error)*error=error_with_domain(external_class("_OBJC_CLASS_$_NSError"),selector,copy_string("NSCocoaErrorDomain"),261,0);
     return result;
 }
 static Word string_file_detect(Word cls,const char *selector,struct HostObject *url,Word *used_encoding,Word *error) {
-    if (!url || !url->content[1]) return file_failure(error,"Non-file URL",ENOTSUP);
-    struct HostObject *data=(void *)data_url(external_class("_OBJC_CLASS_$_NSData"),selector,url);
-    if (!data) return file_failure(error,string_bytes(url_path(url),selector),errno);
+    if (!url) return file_failure(error,"Nil URL",EINVAL);
+    struct HostObject *data=(void *)data_url_options(external_class("_OBJC_CLASS_$_NSData"),selector,url,0,error);
+    if (!data) return 0;
     const unsigned char *bytes=(void *)data_buffer(data); size_t length=data->content[0],skip=0;
     Word encoding=4;
     if (length>=4 && (!memcmp(bytes,"\0\0\xfe\xff",4) || !memcmp(bytes,"\xff\xfe\0\0",4))) encoding=0x8c000100;
@@ -130,13 +131,13 @@ static int copy_private_file(const char *source,const char *destination,unsigned
         return 0;
     }
     if (!S_ISREG(info.st_mode)) { errno=ENOTSUP; return -1; }
-    int from=open(source,O_RDONLY|O_CLOEXEC);
+    int from=io_open(source,O_RDONLY|O_CLOEXEC,0);
     if (from<0) return -1;
     int to=open(destination,O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC,info.st_mode&0777);
-    if (to<0) { int error=errno; close(from); errno=error; return -1; }
+    if (to<0) { int error=errno; io_close(from); errno=error; return -1; }
     char buffer[65536]; int error=0;
     for (;;) {
-        ssize_t count=read(from,buffer,sizeof(buffer));
+        ssize_t count=io_read(from,buffer,sizeof(buffer));
         if (count<0 && errno==EINTR) continue;
         if (count<0) { error=errno; break; }
         if (!count) break;
@@ -149,7 +150,7 @@ static int copy_private_file(const char *source,const char *destination,unsigned
         }
         if (error) break;
     }
-    close(from);
+    io_close(from);
     if (close(to) && !error) error=errno;
     if (error) { unlink(destination); errno=error; return -1; }
     return 0;
@@ -157,10 +158,8 @@ static int copy_private_file(const char *source,const char *destination,unsigned
 static Word manager_copy(Word self,const char *selector,Word source,Word destination,Word *error) {
     const char *to=string_bytes(destination,selector);
     if (!writable_sandbox_path(to)) return file_failure(error,to,errno);
-    char *from=native_path(string_bytes(source,selector));
-    if (!from) return file_failure(error,to,errno);
+    const char *from=string_bytes(source,selector);
     int result=copy_private_file(from,to,0),code=errno;
-    free(from);
     return result ? file_failure(error,to,code) : 1;
 }
 static Word manager_copy_url(Word self,const char *selector,struct HostObject *source,struct HostObject *destination,Word *error) {

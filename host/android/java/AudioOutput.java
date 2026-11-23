@@ -6,11 +6,9 @@ import android.media.AudioFormat;
 import android.media.AudioTrack;
 import android.os.Handler;
 import android.util.Log;
-import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.nio.file.Files;
 import java.util.concurrent.ConcurrentHashMap;
 
 final class AudioOutput {
@@ -57,9 +55,8 @@ final class AudioOutput {
         return null;
     }
 
-    boolean prepare(long token, String filename) {
+    boolean prepare(long token, byte[] file) {
         try {
-            byte[] file = Files.readAllBytes(new File(filename).toPath());
             ByteBuffer data = ByteBuffer.wrap(file).order(ByteOrder.BIG_ENDIAN);
             if (file.length < 8 || data.getInt() != 0x63616666 || data.getShort() != 1) throw new IOException("Expected CAF version 1");
             data.getShort();

@@ -113,7 +113,7 @@ static int socket_close(int fd) {
     pthread_mutex_lock(&darwin_socket_mutex); struct DarwinSocketState **slot=&darwin_socket_states;
     while (*slot && (*slot)->fd!=fd) slot=&(*slot)->next;
     if (*slot) { struct DarwinSocketState *state=*slot; *slot=state->next; free(state); }
-    pthread_mutex_unlock(&darwin_socket_mutex); return close(fd);
+    pthread_mutex_unlock(&darwin_socket_mutex); return io_close(fd);
 }
 static int socket_create(int family,int type,int protocol) { return (int)socket_result(socket(socket_family(family),type,protocol)); }
 static int socket_connect(int fd,const void *address,socklen_t length) {

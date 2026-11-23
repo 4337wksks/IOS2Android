@@ -249,13 +249,10 @@ static Word split_string(Word self,const char *selector,Word delimiter) {
 }
 
 static Word data_from_file(Word cls,const char *selector,Word filename) {
-    char *path=native_path(string_bytes(filename,selector));
-    if (!path) return 0;
-    int fd=open(path,O_RDONLY|O_CLOEXEC);
-    free(path);
+    int fd=io_open(string_bytes(filename,selector),O_RDONLY|O_CLOEXEC,0);
     if (fd<0) return 0;
     struct stat info;
-    if (fstat(fd,&info) || info.st_size<0 || (uint64_t)info.st_size>SIZE_MAX-sizeof(struct HostObject)) { close(fd); return 0; }
+    if (io_fstat(fd,&info) || info.st_size<0 || (uint64_t)info.st_size>SIZE_MAX-sizeof(struct HostObject)) { io_close(fd); return 0; }
     size_t length=(size_t)info.st_size;
     struct HostObject *data=calloc(1,sizeof(*data)+length);
     if (!data) stop("Allocation failed",selector);
@@ -266,12 +263,12 @@ static Word data_from_file(Word cls,const char *selector,Word filename) {
     }
     size_t done=0;
     while (done<length) {
-        ssize_t count=read(fd,(char *)(data+1)+done,length-done);
+        ssize_t count=io_read(fd,(char *)(data+1)+done,length-done);
         if (count<0 && errno==EINTR) continue;
-        if (count<=0) { close(fd); free(data); return 0; }
+        if (count<=0) { io_close(fd); free(data); return 0; }
         done+=(size_t)count;
     }
-    close(fd);
+    io_close(fd);
     return (Word)data;
 }
 
@@ -288,11 +285,11 @@ static Word data_init_bytes(Word self,const char *selector,const void *bytes,siz
 }
 
 static Word dictionary_from_file(Word cls,const char *selector,Word filename) {
-    char *path=native_path(string_bytes(filename,selector));
-    if (!path) return 0;
+    struct HostObject *data=(void *)data_from_file(external_class("_OBJC_CLASS_$_NSData"),selector,filename);
+    if(!data)return 0;if(data->content[0]>UINT32_MAX){free(data);return 0;}
     plist_t node=NULL;
-    int valid=plist_read_from_file(path,&node,NULL)==PLIST_ERR_SUCCESS;
-    free(path);
+    int valid=plist_from_memory((const char *)data_buffer(data),(uint32_t)data->content[0],&node,NULL)==PLIST_ERR_SUCCESS;
+    free(data);
     if (!valid) return 0;
     if (plist_get_node_type(node)!=PLIST_DICT) { plist_free(node); return 0; }
     Word result=plist_object(node,0);

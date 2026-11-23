@@ -1,5 +1,7 @@
  
 static unsigned char cf_string_cstring(Word,char *,intptr_t,uint32_t);
+static unsigned char core_source_equal(Word,Word);
+static Word core_source_hash(Word),core_source_description(Word);
 static Word cf_array_create(Word allocator,const Word *values,intptr_t count,const void *callbacks) {
     if (allocator || count<0) stop("Invalid arguments","CFArrayCreate");
     if (callbacks) stop("Unsupported callbacks","CFArrayCreate");
@@ -93,6 +95,7 @@ static struct CoreUuid *uuid_from_bytes(Word allocator,struct UuidBytes bytes) {
 static unsigned char cf_equal(Word first,Word second) {
     if (first==second) return 1;
     if (!first || !second) return 0;
+    if(read_word(first)==(Word)&runloop_source_tag && read_word(second)==(Word)&runloop_source_tag)return core_source_equal(first,second);
     if (read_word(first)==(Word)&uuid_tag && read_word(second)==(Word)&uuid_tag)
         return !memcmp(((struct CoreUuid *)first)->bytes,((struct CoreUuid *)second)->bytes,16);
     if (read_word(first)==external_class("_OBJC_CLASS_$_NSData") && read_word(second)==external_class("_OBJC_CLASS_$_NSData"))
@@ -102,6 +105,7 @@ static unsigned char cf_equal(Word first,Word second) {
 static Word cf_hash(Word object) {
     if (!object) stop("Nil object","CFHash");
     Word cls=read_word(object);
+    if(cls==(Word)&runloop_source_tag)return core_source_hash(object);
     const unsigned char *bytes=NULL;
     size_t size=0;
     struct TextView text={0};
@@ -116,7 +120,7 @@ static Word cf_hash(Word object) {
     free(text.owned);
     return hash;
 }
-static Word cf_description(Word object) { return object_description(object,"CFCopyDescription"); }
+static Word cf_description(Word object) { return object && read_word(object)==(Word)&runloop_source_tag ? core_source_description(object) : object_description(object,"CFCopyDescription"); }
 static Word cf_set_mutable(Word allocator,intptr_t capacity,const Word *callbacks) {
     if (allocator || capacity<0) stop("Invalid arguments","CFSetCreateMutable");
     /* Object-equality, nonretaining sets bridge directly to NSMutableSet.

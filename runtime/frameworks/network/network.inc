@@ -1,8 +1,108 @@
  
 
+static jstring http_java_string(JNIEnv *,Word);
+static Word data_from_data(Word,const char *,struct HostObject *);
+struct NetServiceEvent { unsigned event;int code;struct NetServiceEvent *next; };
+struct NetService { Word domain,type,name,delegate,txt,loop,delivery;int port,state;unsigned options;Method callbacks[4];unsigned epoch,cached;struct NetServiceEvent *events,*tail; };
+static pthread_mutex_t net_service_mutex=PTHREAD_MUTEX_INITIALIZER;
+static struct NetService *net_service(Word object) { struct HostObject *host=(void *)object;if(!host->content[0]){host->content[0]=(Word)calloc(1,sizeof(struct NetService));if(!host->content[0])stop("Allocation failed","NSNetService");}return (void *)host->content[0]; }
+static void net_service_callback(Word object,unsigned event,int code) {
+    struct NetService *service=net_service(object);static const char *selectors[]={"netServiceWillPublish:","netServiceDidPublish:","netService:didNotPublish:","netServiceDidStop:"};
+    if(!service->delegate)return;if(service->epoch!=method_cache_epoch || !service->cached){for(unsigned i=0;i<COUNT(selectors);++i)service->callbacks[i]=find_implementation(service->delegate,selectors[i]);service->epoch=method_cache_epoch;service->cached=1;}
+    Method method=service->callbacks[event];if(!method)return;Word error=0;
+    if(event==2){struct GuestMap *info=(void *)empty_map(external_class("_OBJC_CLASS_$_NSDictionary"));map_set(info,"NSNetService",number_integer((Word)(intptr_t)code),copy_string("NSNetServicesErrorCode"));map_set(info,"NSNetService",number_integer(10),copy_string("NSNetServicesErrorDomain"));error=(Word)info;}
+    method(service->delegate,selectors[event],object,error,0,0);
+}
+static void net_service_deliver(void *context) {
+    Word object=(Word)context;struct NetService *service=net_service(object);pthread_mutex_lock(&net_service_mutex);struct NetServiceEvent *events=service->events;service->events=service->tail=NULL;pthread_mutex_unlock(&net_service_mutex);
+    while(events){struct NetServiceEvent *next=events->next;unsigned kind=events->event;int code=events->code;free(events);net_service_callback(object,kind,code);events=next;}
+    if((service->state==0 || service->state==4) && !service->events){Word delivery=service->delivery;service->delivery=0;loop_function_close(delivery);}
+}
+static void net_service_notify(Word object,unsigned event,int code) {
+    struct NetService *service=net_service(object);struct NetServiceEvent *item=malloc(sizeof(*item));if(!item)stop("Allocation failed","NSNetService event");*item=(struct NetServiceEvent){event,code,NULL};
+    pthread_mutex_lock(&net_service_mutex);if(service->tail)service->tail->next=item;else service->events=item;service->tail=item;Word delivery=service->delivery;pthread_mutex_unlock(&net_service_mutex);if(delivery)loop_function_signal(delivery);
+}
+static Word net_service_init(Word object,const char *selector,Word domain,Word type,Word name,int port) {
+    if(!domain || !type || !name)return 0;const char *kind=string_bytes(type,selector),*label=string_bytes(name,selector);size_t length=strlen(kind);
+    if(!*label || kind[0]!='_' || length<7 || (strcmp(kind+length-6,"._tcp.") && strcmp(kind+length-6,"._udp.")) || port<-1 || port>65535)return 0;
+    struct NetService *service=net_service(object);service->domain=text_copy(domain,"copy");service->type=text_copy(type,"copy");service->name=text_copy(name,"copy");service->port=port;service->loop=core_current_runloop();return object;
+}
+static Word net_service_property(Word object,const char *selector) {
+    struct NetService *service=net_service(object);if(!strcmp(selector,"domain"))return service->domain;if(!strcmp(selector,"type"))return service->type;if(!strcmp(selector,"name"))return service->name;if(!strcmp(selector,"port"))return (Word)(intptr_t)service->port;if(!strcmp(selector,"delegate"))return service->delegate;return service->txt;
+}
+static void net_service_set_delegate(Word object,const char *selector,Word delegate) { struct NetService *service=net_service(object);service->delegate=delegate;service->cached=0; }
+static Word net_service_txt_dictionary(Word cls,const char *selector,struct HostObject *data) {
+    if(!data)return 0;const unsigned char *bytes=(void *)data_buffer(data);size_t size=data->content[0],offset=0;Word map=empty_map(external_class("_OBJC_CLASS_$_NSDictionary"));
+    while(offset<size){size_t length=bytes[offset++];if(length>size-offset)return 0;if(!length)continue;size_t separator=0;while(separator<length && bytes[offset+separator]!='=')++separator;if(!separator)return 0;
+        for(size_t i=0;i<separator;++i)if(bytes[offset+i]<32 || bytes[offset+i]>126)return 0;
+        Word key=text_decode(external_class("_OBJC_CLASS_$_NSString"),bytes+offset,separator,1),value=separator<length ? data_with_bytes(external_class("_OBJC_CLASS_$_NSData"),selector,bytes+offset+separator+1,length-separator-1) : (Word)&null_value;
+        map_set((void *)map,selector,value,key);offset+=length;}
+    return map;
+}
+static Word net_service_txt_data(Word cls,const char *selector,struct GuestMap *map) {
+    if(!map)return 0;Word result=data_with_bytes(external_class("_OBJC_CLASS_$_NSMutableData"),selector,NULL,0);
+    for(size_t i=0;i<map->count;++i){const char *key=string_bytes(map->entries[i].key,selector);size_t length=strlen(key);if(!length || length>255)return 0;for(size_t j=0;j<length;++j)if((unsigned char)key[j]<32 || (unsigned char)key[j]>126 || key[j]=='=')return 0;
+        Word value=map->entries[i].value;const void *bytes=NULL;size_t count=0;
+        if(value!=(Word)&null_value){if(!value)return 0;Word type=read_word(value);if(class_inherits(type,external_class("_OBJC_CLASS_$_NSData"))){bytes=(void *)data_buffer((void *)value);count=read_word(value+8);}
+            else if(class_inherits(type,external_class("_OBJC_CLASS_$_NSString"))){Word data=encoded_string(value,selector,4);bytes=(void *)data_buffer((void *)data);count=read_word(data+8);}else return 0;
+            if(count>254 || length>254-count)return 0;}
+        unsigned char amount=(unsigned char)(length+(value==(Word)&null_value ? 0 : 1+count));data_append_bytes((void *)result,selector,&amount,1);data_append_bytes((void *)result,selector,key,length);
+        if(value!=(Word)&null_value){data_append_bytes((void *)result,selector,"=",1);data_append_bytes((void *)result,selector,bytes,count);}}
+    return data_from_data(external_class("_OBJC_CLASS_$_NSData"),selector,(void *)result);
+}
+static Word net_service_set_txt(Word object,const char *selector,Word data) {
+    struct NetService *service=net_service(object);if(service->state==1 || service->state==2 || service->state==3)return 0;
+    if(data && !net_service_txt_dictionary(0,selector,(void *)data))return 0;service->txt=data ? data_copy(data,"copy") : 0;return 1;
+}
+static void net_service_fail(Word object,int code) { struct NetService *service=net_service(object);if(!service->delivery)service->delivery=loop_function_create(service->loop ? service->loop : core_current_runloop(),net_service_deliver,(void *)object,NULL);net_service_notify(object,2,code); }
+static void net_service_publish(Word object,const char *selector,unsigned options) {
+    struct NetService *service=net_service(object);const char *domain=service->domain ? string_bytes(service->domain,selector) : "";
+    if(service->state==1 || service->state==2 || service->state==3){net_service_fail(object,-72003);return;}
+    if(!service->delivery)service->delivery=loop_function_create(service->loop ? service->loop : core_current_runloop(),net_service_deliver,(void *)object,NULL);
+    if((options&~1U) || service->port<1 || !service->type || !service->name || (*domain && strcmp(domain,"local."))){service->state=4;net_service_fail(object,-72004);return;}
+    service->state=1;service->options=options;net_service_notify(object,0,0);if(service->state!=1)return;
+    JNIEnv *env=attached_environment(selector);jclass type=(*env)->GetObjectClass(env,activity);jmethodID method=(*env)->GetMethodID(env,type,"publishNetworkService","(JLjava/lang/String;Ljava/lang/String;I[BZ)V");
+    jstring kind=http_java_string(env,service->type),name=http_java_string(env,service->name);jbyteArray txt=NULL;
+    if(service->txt){Word length=read_word(service->txt+8);if(length>INT32_MAX)stop("TXT record too large",selector);txt=(*env)->NewByteArray(env,(jsize)length);if(!txt)stop("Allocation failed",selector);(*env)->SetByteArrayRegion(env,txt,0,(jsize)length,(void *)data_buffer((void *)service->txt));}
+    (*env)->CallVoidMethod(env,activity,method,(jlong)object,kind,name,(jint)service->port,txt,(jboolean)(options&1));(*env)->DeleteLocalRef(env,type);(*env)->DeleteLocalRef(env,kind);(*env)->DeleteLocalRef(env,name);if(txt)(*env)->DeleteLocalRef(env,txt);
+    if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);service->state=4;net_service_fail(object,-72000);}
+}
+static void net_service_schedule(Word object,const char *selector,Word loop,Word mode) {
+    if(!loop || !mode)stop("Missing NSNetService runloop",selector);const char *name=string_bytes(mode,selector);if(strcmp(name,"kCFRunLoopDefaultMode") && strcmp(name,"NSDefaultRunLoopMode") && strcmp(name,"kCFRunLoopCommonModes") && strcmp(name,"NSRunLoopCommonModes"))stop("Unsupported NSNetService runloop mode",selector);
+    struct NetService *service=net_service(object);if(service->delivery && service->loop!=loop){loop_function_close(service->delivery);service->delivery=0;}service->loop=loop;if(!service->delivery)service->delivery=loop_function_create(loop,net_service_deliver,(void *)object,NULL);if(service->events)loop_function_signal(service->delivery);
+}
+static void net_service_unschedule(Word object,const char *selector,Word loop,Word mode) { struct NetService *service=net_service(object);if(service->loop==loop){loop_function_close(service->delivery);service->delivery=0;} }
+static void net_service_publish_plain(Word object,const char *selector) { net_service_publish(object,selector,0); }
+static void net_service_stop(Word object,const char *selector) {
+    struct NetService *service=net_service(object);if(service->state!=1 && service->state!=2)return;service->state=3;
+    JNIEnv *env=attached_environment(selector);jclass type=(*env)->GetObjectClass(env,activity);jmethodID method=(*env)->GetMethodID(env,type,"stopNetworkService","(J)V");(*env)->CallVoidMethod(env,activity,method,(jlong)object);(*env)->DeleteLocalRef(env,type);
+    if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);service->state=4;net_service_fail(object,-72000);}
+}
+JNIEXPORT jstring JNICALL HOST_JNI(HostActivity_networkServiceEvent)(JNIEnv *env,jobject instance,jlong token,jint event,jint code,jstring name) {
+    may_unwind=1;int failed=setjmp(boundary);if(!failed){struct NetService *service=net_service((Word)token);
+        if(event==1){if(service->state==1){service->state=2;if(name)service->name=string_from_java(env,name,"NSNetService name");net_service_notify(token,1,0);}}
+        else if(event==2){service->state=4;net_service_notify(token,2,code);}
+        else if(event==3){service->state=0;net_service_notify(token,3,0);}
+        else if(event==4){service->state=2;LOG("NSNetService stop failed: %d",code);}}
+    may_unwind=0;return failed ? (*env)->NewStringUTF(env,status) : NULL;
+}
+static Method net_service_method(Word object,const char *selector,const char *receiver,int class_receiver) {
+    if(!receiver || strcmp(receiver,"_OBJC_CLASS_$_NSNetService"))return NULL;
+    if(class_receiver){if(!strcmp(selector,"dictionaryFromTXTRecordData:"))return (Method)net_service_txt_dictionary;if(!strcmp(selector,"dataFromTXTRecordDictionary:"))return (Method)net_service_txt_data;return NULL;}
+    if(!strcmp(selector,"initWithDomain:type:name:port:"))return (Method)net_service_init;
+    if(!strcmp(selector,"setDelegate:"))return (Method)net_service_set_delegate;
+    if(!strcmp(selector,"publishWithOptions:"))return (Method)net_service_publish;
+    if(!strcmp(selector,"publish"))return (Method)net_service_publish_plain;
+    if(!strcmp(selector,"stop"))return (Method)net_service_stop;
+    if(!strcmp(selector,"setTXTRecordData:"))return (Method)net_service_set_txt;
+    if(!strcmp(selector,"scheduleInRunLoop:forMode:"))return (Method)net_service_schedule;
+    if(!strcmp(selector,"removeFromRunLoop:forMode:"))return (Method)net_service_unschedule;
+    const char *properties[]={"domain","type","name","port","delegate","TXTRecordData"};for(unsigned i=0;i<COUNT(properties);++i)if(!strcmp(selector,properties[i]))return (Method)net_service_property;return NULL;
+}
 struct Request { Word isa, url, method, headers, body; double timeout; Word policy,body_stream,protocol_properties; unsigned char cookies; };
 struct Session { Word isa, configuration, delegate, queue; int invalidated; Word description; };
 static Word session_ensure_queue(struct Session *);
+static Word cookie_storage_shared(Word);
 static Word default_session_configuration(Word cls) { return host_allocate(cls); }
 struct SessionConfig { Word policy,headers; double request_timeout,resource_timeout; int discretionary,cellular; Word maximum_connections,cookie_storage,url_cache,credential_storage,cookie_policy; int cookies,pipelining; Word background_identifier; };
 static struct SessionConfig *configuration_values(struct HostObject *object) {
@@ -11,6 +111,7 @@ static struct SessionConfig *configuration_values(struct HostObject *object) {
         if (!values) stop("Allocation failed","NSURLSessionConfiguration");
         values->request_timeout=60; values->resource_timeout=604800; values->cellular=1;
         values->maximum_connections=6; values->cookies=1;
+        values->cookie_policy=2;values->cookie_storage=cookie_storage_shared(external_class("_OBJC_CLASS_$_NSHTTPCookieStorage"));
         object->content[0]=(Word)values;
     }
     return (void *)object->content[0];
@@ -20,6 +121,11 @@ static Word background_session_configuration(Word cls,const char *selector,Word 
     Word result=default_session_configuration(cls);
     configuration_values((void *)result)->background_identifier=text_copy(identifier,"copy");
     return result;
+}
+static Word ephemeral_session_configuration(Word cls) {
+    Word object=default_session_configuration(cls);
+    configuration_values((void *)object)->cookie_storage=host_allocate(external_class("_OBJC_CLASS_$_NSHTTPCookieStorage"));
+    return object;
 }
 static Word configuration_identifier(struct HostObject *object) { return configuration_values(object)->background_identifier; }
 static void configuration_policy(struct HostObject *object,const char *selector,Word value) { configuration_values(object)->policy=value; }
@@ -181,7 +287,8 @@ static Method network_method(Word object,const char *selector,const char *receiv
         if (!strcmp(selector,"removePropertyForKey:inRequest:")) return (Method)protocol_remove_request_property;
     }
     if (!strcmp(receiver,"_OBJC_CLASS_$_NSURLSessionConfiguration")) {
-        if (class_receiver && (!strcmp(selector,"defaultSessionConfiguration") || !strcmp(selector,"ephemeralSessionConfiguration"))) return (Method)default_session_configuration;
+        if (class_receiver && !strcmp(selector,"defaultSessionConfiguration")) return (Method)default_session_configuration;
+        if (class_receiver && !strcmp(selector,"ephemeralSessionConfiguration")) return (Method)ephemeral_session_configuration;
         if (class_receiver && (!strcmp(selector,"backgroundSessionConfigurationWithIdentifier:") || !strcmp(selector,"backgroundSessionConfiguration:"))) return (Method)background_session_configuration;
         if (!class_receiver) {
             if (!strcmp(selector,"identifier")) return (Method)configuration_identifier;

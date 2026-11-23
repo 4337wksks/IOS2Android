@@ -28,14 +28,7 @@ static VkResult metal_compute_variant(struct MetalCompute *compute,const uint32_
     VkSpecializationInfo specialization={.mapEntryCount=3,.pMapEntries=map,.dataSize=12,.pData=size};
     VkComputePipelineCreateInfo info={.sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,.layout=compute->layout,
         .stage={.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_COMPUTE_BIT,.module=compute->function->module,.pName="main",.pSpecializationInfo=&specialization}};
-    pthread_mutex_lock(&metal_pipeline_cache_mutex);
-    VkResult result=VK_SUCCESS;
-    if (!metal_pipeline_cache) {
-        VkPipelineCacheCreateInfo cache={.sType=VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-        result=VKD(vkCreatePipelineCache)(vulkan.device,&cache,NULL,&metal_pipeline_cache);
-    }
-    if (result==VK_SUCCESS) result=vulkan_compile_pipeline(1,metal_pipeline_cache,1,&info,&variant->pipeline);
-    pthread_mutex_unlock(&metal_pipeline_cache_mutex);
+    VkResult result=metal_cached_compile(1,1,&info,&variant->pipeline);
     if (result==VK_SUCCESS) { variant->next=compute->variants; compute->variants=variant; *output=variant->pipeline; }
     else { if (variant->pipeline) VKD(vkDestroyPipeline)(vulkan.device,variant->pipeline,NULL); free(variant); }
     pthread_mutex_unlock(&compute->mutex); return result;

@@ -64,11 +64,6 @@ public final class HostActivity extends Activity {
     private native void configureLabelDiagnostics(boolean enabled);
     private native void sampleCpu(boolean enabled);
     private native void dumpLabelDiagnostics();
-    @Override protected void onNewIntent(Intent intent) {
-        super.onNewIntent(intent);
-        setIntent(intent);
-        if (libraryLoaded && intent.hasExtra("businessDiagnostics")) configureBusinessDiagnostics(intent);
-    }
     private void configureBusinessDiagnostics(Intent intent) {
         String requested=intent.getStringExtra("businessDiagnostics");
         Set<String> categories=new HashSet<>(Arrays.asList(requested==null ? new String[0] : requested.split(",")));
@@ -115,6 +110,14 @@ public final class HostActivity extends Activity {
         Log.i("I2AGuest","[DIAG-label-layout] reported="+reported+" total="+guestLabels.size()+" pending="+pendingLabels.size());
     }
     // DEVELOPMENT_END
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        // DEVELOPMENT_BEGIN
+        if (libraryLoaded && intent.hasExtra("businessDiagnostics")) configureBusinessDiagnostics(intent);
+        // DEVELOPMENT_END
+        receiveNotificationIntent(intent);
+    }
     private TextView guestStatus;
     private LaunchScreenView guestLaunch;
     private static final class LaunchScreenView extends android.view.View {
@@ -250,7 +253,7 @@ public final class HostActivity extends Activity {
             OpacityAnimation animation=new OpacityAnimation(changed,before,after,completion);
             for(AlphaChannel channel:animation.channels) alphaChannels.put(channel.token,channel);
             for(int i=0;i<tokens.length;i++) {
-                android.view.View view=guestLabels.get(tokens[i]); if(view==null) view=guestControls.get(tokens[i]); if(view==null) continue;
+                android.view.View view=guestLabels.get(tokens[i]); if(view==null) view=guestControls.get(tokens[i]); if(view==null && webContent!=null)view=webContent.view(tokens[i]); if(view==null && textEditors!=null)view=textEditors.view(tokens[i]); if(view==null) continue;
                 opacityViews.put(tokens[i],new OpacityState(view,Arrays.copyOfRange(ancestors,offsets[i],offsets[i+1]),Arrays.copyOfRange(model,offsets[i],offsets[i+1])));
                 animation.affected.add(tokens[i]);
             }
@@ -268,7 +271,7 @@ public final class HostActivity extends Activity {
     private void reorderGuestLabels(long[] order) {
         mainHandler.post(()-> {
             if(guestLabelOverlay==null || isDestroyed()) return;
-            for(long token:order) { android.view.View view=guestLabels.get(token); if(view==null) view=guestControls.get(token); if(view!=null) guestLabelOverlay.bringChildToFront(view); }
+            for(long token:order) { android.view.View view=guestLabels.get(token); if(view==null) view=guestControls.get(token); if(view==null && webContent!=null)view=webContent.view(token); if(view==null && textEditors!=null)view=textEditors.view(token); if(view!=null) guestLabelOverlay.bringChildToFront(view); }
         });
     }
     private final TextRenderer guestText = new TextRenderer(this);
@@ -420,12 +423,14 @@ public final class HostActivity extends Activity {
         }
         view.setTag(new ControlUpdate(null,false,m,o,update.description));
     }
-    private void guestKeepScreenOn(boolean enabled) {
-        mainHandler.post(() -> {
-            if (enabled) getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-            else getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        });
+    private boolean guestScreenRequested;
+    private final java.util.concurrent.atomic.AtomicInteger processDisplayRequests=new java.util.concurrent.atomic.AtomicInteger();
+    private void applyGuestScreenPolicy() {
+        if(isDestroyed())return;
+        if(guestScreenRequested || processDisplayRequests.get()>0)getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        else getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
+    private void guestKeepScreenOn(boolean enabled) { mainHandler.post(()->{guestScreenRequested=enabled;applyGuestScreenPolicy();}); }
     private int[] guestSafeInsets() {
         android.view.WindowInsets insets = getWindow().getDecorView().getRootWindowInsets();
         if (insets == null) return new int[4];
@@ -523,11 +528,29 @@ public final class HostActivity extends Activity {
     private boolean libraryLoaded, guestStarted;
     private android.widget.EditText guestInput;
     private TextInput guestIme;
+    private TextInput.Editors textEditors;
     private KeyboardState guestKeyboard;
     private boolean guestKeyboardReady;
     private long guestInputToken;
     private boolean guestInputSync;
     private native String editGuestInput(long token, String value, boolean submit);
+    private native boolean editorFocus(long token,boolean focused);
+    private native void editorSelection(long token,int start,int end);
+    private native void editorScroll(long token,float x,float y,float width,float height);
+    private TextInput.Editors textEditors(){
+        if(textEditors==null)textEditors=new TextInput.Editors(this,guestLabelOverlay,new TextInput.Editors.Callback(){
+            public String edit(long token,String text){return editGuestInput(token,text,false);}
+            public boolean focus(long token,boolean focused){return editorFocus(token,focused);}
+            public void selection(long token,int start,int end){editorSelection(token,start,end);}
+            public void scroll(long token,float x,float y,float width,float height){editorScroll(token,x,y,width,height);}
+            public void alpha(long token,android.view.View view,float value){applyGuestAlpha(token,view,value);}
+            public void detached(long token){opacityViews.remove(token);}
+        });
+        return textEditors;
+    }
+    private void syncGuestEditor(long token,CharSequence text,float[] metrics,int[] options){mainHandler.post(()->{if(!isDestroyed() && guestLabelOverlay!=null)textEditors().sync(token,text,metrics,options);});}
+    private void focusGuestEditor(long token,boolean show){mainHandler.post(()->{if(!isDestroyed() && textEditors!=null)textEditors.focus(token,show);});}
+    private void closeGuestEditor(long token){mainHandler.post(()->{if(textEditors!=null)textEditors.remove(token);});}
     private native String updateGuestKeyboard(boolean visible, int x, int y, int width, int height);
     private float[] guestFontMetrics(String name, int traits, float size) { return guestText.fontMetrics(name, traits, size); }
     private byte[] renderGuestImage(int width, int height, double scale, boolean opaque, double[] commands, byte[][] images) { return TextRenderer.renderImage(width,height,(float)scale,opaque,commands,images); }
@@ -569,6 +592,7 @@ public final class HostActivity extends Activity {
     }
     private void hideGuestInput(long token) {
         mainHandler.post(() -> {
+            if(textEditors!=null && textEditors.focus(token,false))return;
             if (guestInput == null || guestInputToken != token) return;
             guestInputToken = 0;
             guestIme.cancel();
@@ -577,6 +601,11 @@ public final class HostActivity extends Activity {
         });
     }
     private native String deliverTouches(int action, int changed, long timestamp, int[] ids, float[] positions);
+    private double[] gestureConfiguration() {
+        android.view.ViewConfiguration configuration = android.view.ViewConfiguration.get(this);
+        return new double[]{configuration.getScaledTouchSlop()/getResources().getDisplayMetrics().density,
+            android.view.ViewConfiguration.getDoubleTapTimeout()/1000.0, android.view.ViewConfiguration.getLongPressTimeout()/1000.0};
+    }
     private boolean guestTouch(android.view.MotionEvent event) {
         if (!guestLoaded || startupFailed) return true;
         int action = event.getActionMasked();
@@ -773,6 +802,18 @@ public final class HostActivity extends Activity {
     private final ExecutorService operationWorkers = Executors.newCachedThreadPool();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private HelpshiftBridge helpshift;
+    private WebContent webContent;
+    private native long webViewEvent(long token,int event,long operation,String data);
+    private WebContent webContent() {
+        if(webContent==null)webContent=new WebContent(this,guestLabelOverlay,new WebContent.Callback() {
+            @Override public long event(long token,int kind,long operation,String data) { return webViewEvent(token,kind,operation,data); }
+            @Override public void alpha(long token,android.view.View view,float value) { applyGuestAlpha(token,view,value); }
+            @Override public void detached(long token) { opacityViews.remove(token); }
+        });
+        return webContent;
+    }
+    private void webCommand(long token,String action,String payload) { mainHandler.post(()-> { if(!isDestroyed() && guestLabelOverlay!=null)webContent().command(token,action,payload); }); }
+    private void syncGuestWeb(long token,float[] metrics,int[] options) { mainHandler.post(()-> { if(!isDestroyed() && guestLabelOverlay!=null)webContent().sync(token,metrics,options); }); }
     private native void deliverHelpshiftEvent(String event,String data);
     private void helpshiftCommand(String operation,String data) {
         mainHandler.post(()-> {
@@ -792,6 +833,7 @@ public final class HostActivity extends Activity {
     @Override public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(request, permissions, results);
         if (photos != null) photos.permissionResult(request, results);
+        if (request == NOTIFICATION_PERMISSION) completeNotificationPermissions();
     }
     private CredentialStore keychain;
     private byte[] keychainRead() throws java.security.GeneralSecurityException, IOException { return keychain.read(); }
@@ -806,7 +848,7 @@ public final class HostActivity extends Activity {
     private int audioSessionConfigure(int property, double value) { return audioSession.configure(property, value); }
     private double audioSessionProperty(int property) { return audioSession.property(property); }
     private String[][] audioSessionRoute() { return audioSession.route(); }
-    private boolean prepareAudio(long token, String path) { return sound.prepare(token, path); }
+    private boolean prepareAudio(long token, byte[] data) { return sound.prepare(token, data); }
     private String audioError() { return sound.lastError(); }
     private boolean playAudio(long token) { return sound.play(token); }
     private void pauseAudio(long token) { sound.pause(token); }
@@ -823,6 +865,7 @@ public final class HostActivity extends Activity {
     private void resolveConnectionAuthentication(long token, int disposition) { http.resolveAuthentication(token, disposition); }
     private void resolveConnectionDecision(long token, int disposition) { http.resolveDecision(token, disposition); }
     private void suspendConnection(long token, boolean suspended) { http.suspend(token, suspended); }
+    private String cookieCommand(long token,String operation,String json) throws Exception { return http.cookieCommand(token,operation,json); }
     private native String completeAnimation(long block,boolean completed);
     private native String completeAlert(long alert, int action);
     private native String editAlertField(long alert, int index, String value);
@@ -886,6 +929,27 @@ public final class HostActivity extends Activity {
         mainHandler.postDelayed(action, milliseconds);
     }
     private final ConcurrentHashMap<Long, BackgroundTask> backgroundTasks = new ConcurrentHashMap<>();
+    private static final class ProcessActivity {
+        final long options;final PowerManager.WakeLock wake;
+        ProcessActivity(long options,PowerManager.WakeLock wake){this.options=options;this.wake=wake;}
+    }
+    private final ConcurrentHashMap<Long,ProcessActivity> processActivities=new ConcurrentHashMap<>();
+    private boolean processActivitiesClosed;
+    private synchronized boolean processActivity(long identifier,long options,boolean begin) {
+        if(!begin){ProcessActivity activity=processActivities.remove(identifier);if(activity==null)return true;
+            if(activity.wake!=null && activity.wake.isHeld())activity.wake.release();
+            if((activity.options&(1L<<40))!=0){processDisplayRequests.decrementAndGet();mainHandler.post(this::applyGuestScreenPolicy);}return true;
+        }
+        if(processActivitiesClosed || isDestroyed() || isFinishing())return false;
+        PowerManager.WakeLock wake=null;
+        try {
+            if((options&(1L<<20))!=0){PowerManager manager=(PowerManager)getSystemService(POWER_SERVICE);wake=manager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,"I2A:process-activity");wake.setReferenceCounted(false);wake.acquire();}
+            ProcessActivity activity=new ProcessActivity(options,wake);
+            if(processActivities.putIfAbsent(identifier,activity)!=null){if(wake!=null && wake.isHeld())wake.release();return true;}
+            if((options&(1L<<40))!=0){processDisplayRequests.incrementAndGet();mainHandler.post(this::applyGuestScreenPolicy);}
+            return true;
+        }catch(RuntimeException unavailable){if(wake!=null && wake.isHeld())wake.release();return false;}
+    }
     private static final class BackgroundTask {
         final PowerManager.WakeLock wakeLock;
         final Runnable expiration;
@@ -955,6 +1019,28 @@ public final class HostActivity extends Activity {
             level, state, power != null && power.isPowerSaveMode());
         updateGuestStatusBarSnapshot(getWindow().getDecorView().getRootWindowInsets());
     }
+    private String systemProxySettings() {
+        try {
+            ConnectivityManager manager=(ConnectivityManager)getSystemService(CONNECTIVITY_SERVICE);
+            android.net.ProxyInfo proxy=manager.getDefaultProxy();
+            JSONObject result=new JSONObject();
+            result.put("HTTPEnable",0); result.put("HTTPSEnable",0); result.put("SOCKSEnable",0);
+            if(proxy==null) return result.toString();
+            android.net.Uri pac=proxy.getPacFileUrl();
+            if(pac!=null && !android.net.Uri.EMPTY.equals(pac)) {
+                result.put("ProxyAutoConfigEnable",1); result.put("ProxyAutoConfigURLString",pac.toString());
+            } else if(proxy.getHost()!=null && !proxy.getHost().isEmpty() && proxy.getPort()>0) {
+                for(String prefix:new String[]{"HTTP","HTTPS"}) {
+                    result.put(prefix+"Enable",1); result.put(prefix+"Proxy",proxy.getHost()); result.put(prefix+"Port",proxy.getPort());
+                }
+                result.put("ExceptionsList",new org.json.JSONArray(proxy.getExclusionList()));
+            }
+            return result.toString();
+        } catch(Exception failure) {
+            Log.w("I2AHost","System proxy settings unavailable: "+failure.getClass().getSimpleName());
+            return null;
+        }
+    }
     private int networkFlags() {
         ConnectivityManager manager = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
         Network network = manager.getActiveNetwork();
@@ -977,6 +1063,15 @@ public final class HostActivity extends Activity {
     }
 
     @Override public void onDestroy() {
+        if(webContent!=null)webContent.close();
+        if(textEditors!=null)textEditors.close();
+        NotificationScheduler.detach(notificationDelivery);
+        completeNotificationPermissions();
+        for (android.net.nsd.NsdManager.RegistrationListener listener : networkServices.values()) {
+            try { ((android.net.nsd.NsdManager)getSystemService(Context.NSD_SERVICE)).unregisterService(listener); } catch (RuntimeException ignored) {}
+        }
+        networkServices.clear();
+        synchronized(this){processActivitiesClosed=true;for(Long identifier:processActivities.keySet())processActivity(identifier,0,false);}
         closeGuestAccessibility();
         for(OpacityAnimation animation:new java.util.ArrayList<>(opacityAnimations)) animation.animator.cancel();
         if(guestLaunch!=null) { guestLaunch.release(); guestLaunch=null; }
@@ -989,11 +1084,106 @@ public final class HostActivity extends Activity {
     }
 
     private boolean notificationsEnabled() {
-        return ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).areNotificationsEnabled();
+        return NotificationScheduler.enabled(this);
     }
 
     private void cancelLocalNotifications() {
-        ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).cancelAll();
+        NotificationScheduler.remove(this, null, false);
+    }
+
+    private static final int NOTIFICATION_PERMISSION = 7301;
+    private final ArrayList<Long> notificationPermissions = new ArrayList<>();
+    private String pendingNotificationResponse;
+    private native String completeNotificationAuthorization(long block, boolean allowed);
+    private native String deliverGuestNotification(String payload, boolean response);
+    private final NotificationScheduler.Delivery notificationDelivery = (payload, response) -> {
+        if (!guestKeyboardReady || isDestroyed() || (!response && activityState != 0)) return false;
+        String failure = deliverGuestNotification(payload, response);
+        if (failure != null) guestFailure(failure);
+        return failure == null;
+    };
+    private final ConcurrentHashMap<Long, android.net.nsd.NsdManager.RegistrationListener> networkServices = new ConcurrentHashMap<>();
+    private native String networkServiceEvent(long token, int event, int code, String name);
+    private void publishNetworkService(long token, String type, String name, int port, byte[] txt, boolean noRename) {
+        mainHandler.post(() -> {
+            android.net.nsd.NsdManager manager = (android.net.nsd.NsdManager)getSystemService(Context.NSD_SERVICE);
+            android.net.nsd.NsdServiceInfo info = new android.net.nsd.NsdServiceInfo();
+            info.setServiceType(type); info.setServiceName(name); info.setPort(port);
+            try {
+                if (txt != null) for (int offset = 0; offset < txt.length;) {
+                    int length = txt[offset++] & 255, end = offset + length, separator = offset;
+                    if (end > txt.length || length == 0) throw new IllegalArgumentException();
+                    while (separator < end && txt[separator] != '=') separator++;
+                    String key = new String(txt, offset, separator-offset, StandardCharsets.US_ASCII);
+                    String value = separator == end ? null : StandardCharsets.UTF_8.newDecoder()
+                        .decode(ByteBuffer.wrap(txt, separator+1, end-separator-1)).toString();
+                    info.setAttribute(key, value); offset = end;
+                }
+            } catch (RuntimeException | java.nio.charset.CharacterCodingException failure) { networkServiceCallback(token, 2, -72000, null); return; }
+            android.net.nsd.NsdManager.RegistrationListener listener = new android.net.nsd.NsdManager.RegistrationListener() {
+                private void event(int event, int code, String current) { mainHandler.post(() -> { if (networkServices.get(token) == this) networkServiceCallback(token, event, code, current); }); }
+                @Override public void onRegistrationFailed(android.net.nsd.NsdServiceInfo service, int code) { event(2, code == android.net.nsd.NsdManager.FAILURE_ALREADY_ACTIVE ? -72003 : -72000, null); }
+                @Override public void onServiceRegistered(android.net.nsd.NsdServiceInfo service) {
+                    if (noRename && !name.equals(service.getServiceName())) { event(2, -72001, null); try { manager.unregisterService(this); } catch (RuntimeException ignored) {} }
+                    else event(1, 0, service.getServiceName());
+                }
+                @Override public void onServiceUnregistered(android.net.nsd.NsdServiceInfo service) { event(3, 0, null); }
+                @Override public void onUnregistrationFailed(android.net.nsd.NsdServiceInfo service, int code) { event(4, -72000, null); }
+            };
+            if (networkServices.putIfAbsent(token, listener) != null) { networkServiceCallback(token, 2, -72003, null); return; }
+            try { manager.registerService(info, android.net.nsd.NsdManager.PROTOCOL_DNS_SD, listener); }
+            catch (RuntimeException failure) { networkServices.remove(token, listener); networkServiceCallback(token, 2, -72000, null); }
+        });
+    }
+    private void networkServiceCallback(long token, int event, int code, String name) {
+        if (!guestLoaded || isDestroyed()) return;
+        String failure = networkServiceEvent(token, event, code, name); if (failure != null) guestFailure(failure);
+        if (event == 2 || event == 3) networkServices.remove(token);
+    }
+    private void stopNetworkService(long token) {
+        mainHandler.post(() -> {
+            android.net.nsd.NsdManager.RegistrationListener listener = networkServices.get(token);
+            if (listener != null) {
+                try { ((android.net.nsd.NsdManager)getSystemService(Context.NSD_SERVICE)).unregisterService(listener); }
+                catch (RuntimeException failure) { networkServiceCallback(token, 4, -72000, null); }
+            }
+        });
+    }
+    private int notificationAuthorization() { return NotificationScheduler.authorization(this); }
+    private void requestNotificationAuthorization(long block) {
+        mainHandler.post(() -> {
+            notificationPermissions.add(block);
+            if (Build.VERSION.SDK_INT >= 33 && !notificationsEnabled() && !isDestroyed()) {
+                if (notificationPermissions.size() == 1) {
+                    NotificationScheduler.requested(this);
+                    requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, NOTIFICATION_PERMISSION);
+                }
+            } else completeNotificationPermissions();
+        });
+    }
+    private void completeNotificationPermissions() {
+        ArrayList<Long> pending = new ArrayList<>(notificationPermissions);
+        notificationPermissions.clear();
+        for (long block : pending) {
+            String failure = completeNotificationAuthorization(block, !isDestroyed() && notificationsEnabled());
+            if (failure != null) guestFailure(failure);
+        }
+    }
+    private String notificationOperation(String operation, String payload) {
+        if (operation.equals("schedule")) return NotificationScheduler.schedule(this, payload);
+        if (operation.equals("pending") || operation.equals("delivered")) return NotificationScheduler.query(this, operation.equals("delivered"));
+        if (operation.equals("removePending") || operation.equals("removeDelivered")) NotificationScheduler.remove(this, payload, operation.equals("removeDelivered"));
+        return null;
+    }
+    private void showLocalNotification(String payload, long options) { NotificationScheduler.show(this, payload, options); }
+    private void receiveNotificationIntent(Intent intent) {
+        String payload = NotificationScheduler.takeResponse(this, intent);
+        if (payload != null) pendingNotificationResponse = payload;
+        if (guestKeyboardReady && pendingNotificationResponse != null) {
+            payload = pendingNotificationResponse;
+            pendingNotificationResponse = null;
+            notificationDelivery.receive(payload, true);
+        }
     }
 
     @Override public void onConfigurationChanged(Configuration configuration) {
@@ -1032,6 +1222,7 @@ public final class HostActivity extends Activity {
         activityState = 2;
         for (BackgroundTask task : backgroundTasks.values()) armBackgroundTask(task);
         updateGuestApplicationState();
+        if(libraryLoaded)operationWorkers.execute(this::persistPipelineCache);
         super.onStop();
     }
 
@@ -1361,8 +1552,9 @@ public final class HostActivity extends Activity {
         return false;
     }
 
+    private String installedApkPath(){return getApplicationInfo().sourceDir;}
     private synchronized String bundleFile(String relative) throws IOException {
-        File root = new File(getCacheDir(), "bundle-" + BuildProfile.BUNDLE_REVISION + "/" + BuildProfile.BUNDLE_NAME);
+        File root = new File(getCacheDir(), "bundle-files/" + BuildProfile.PACKAGE_REVISION + "/" + BuildProfile.BUNDLE_NAME);
         File target = new File(root, relative).getCanonicalFile();
         if (!target.getPath().startsWith(root.getCanonicalPath() + File.separator))
             throw new IOException("Invalid bundle path");
@@ -1383,6 +1575,41 @@ public final class HostActivity extends Activity {
         }
         return target.getPath();
     }
+    private static void removeCacheTree(File directory) throws IOException {
+        Files.walkFileTree(directory.toPath(),new java.nio.file.SimpleFileVisitor<java.nio.file.Path>() {
+            @Override public java.nio.file.FileVisitResult visitFile(java.nio.file.Path file,java.nio.file.attribute.BasicFileAttributes attributes) throws IOException {Files.deleteIfExists(file);return java.nio.file.FileVisitResult.CONTINUE;}
+            @Override public java.nio.file.FileVisitResult postVisitDirectory(java.nio.file.Path path,IOException failure) throws IOException {if(failure!=null)throw failure;Files.deleteIfExists(path);return java.nio.file.FileVisitResult.CONTINUE;}
+        });
+    }
+    private static void pruneCacheVersions(File root,String current) {
+        File[] children=root.listFiles();if(children==null)return;
+        for(File child:children)if(!child.getName().equals(current))try{removeCacheTree(child);}catch(IOException failure){Log.w("I2AGuest","Unable to remove obsolete runtime cache: "+child.getName(),failure);}
+    }
+    private void cleanRuntimeCaches() {
+        operationWorkers.execute(()-> {
+            File[] legacy=getCacheDir().listFiles();if(legacy!=null)for(File child:legacy)if(child.getName().matches("bundle-[0-9a-f]{12}"))try{removeCacheTree(child);}catch(IOException failure){Log.w("I2AGuest","Unable to remove obsolete bundle cache",failure);}
+            pruneCacheVersions(new File(getCacheDir(),"bundle-files"),BuildProfile.PACKAGE_REVISION);
+            pruneCacheVersions(new File(getCodeCacheDir(),"vulkan"),BuildProfile.PACKAGE_REVISION);
+        });
+    }
+    private synchronized String shaderCacheDirectory(long expectedSize) {
+        try {
+            File root=new File(getCodeCacheDir(),"vulkan/"+BuildProfile.PACKAGE_REVISION);
+            if(!root.mkdirs() && !root.isDirectory())throw new IOException("Unable to create the shader cache");
+            File packed=new File(root,"shaders.bin");
+            if(!packed.isFile() || packed.length()!=expectedSize){
+                File temporary=File.createTempFile("shaders-",".tmp",root);
+                try(InputStream input=getAssets().open("i2a/shaders.bin")) {
+                    Files.copy(input,temporary.toPath(),StandardCopyOption.REPLACE_EXISTING);
+                    if(temporary.length()!=expectedSize)throw new IOException("Shader pack size differs from the runtime metadata");
+                    Files.move(temporary.toPath(),packed.toPath(),StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING);
+                } finally {temporary.delete();}
+            }
+            return root.getAbsolutePath();
+        } catch(IOException failure){Log.w("I2AGuest","Shader disk cache unavailable; using APK resources",failure);return null;}
+    }
+    private native void persistPipelineCache();
+    private void schedulePipelineCacheSave(){mainHandler.postDelayed(()->operationWorkers.execute(this::persistPipelineCache),1000);}
 
     private boolean bundleExists(String relative) {
         if (relative.startsWith("/") || Arrays.asList(relative.split("/")).contains("..")) return false;
@@ -1430,6 +1657,9 @@ public final class HostActivity extends Activity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        cleanRuntimeCaches();
+        NotificationScheduler.attach(notificationDelivery);
+        receiveNotificationIntent(getIntent());
         photos = new PhotoWriter(this, mainHandler, operationWorkers, (token, code, description) -> {
             String failure = completePhotoWrite(token, code, description);
             if (failure != null) guestFailure(failure);
@@ -1471,7 +1701,7 @@ public final class HostActivity extends Activity {
                         updateSystemSnapshot();
                         String error = startGuest(getFilesDir().getAbsolutePath());
                         if (error != null) guestFailure(error);
-                        else { guestKeyboardReady = true; guestKeyboard.refresh(); }
+                        else { guestKeyboardReady = true; guestKeyboard.refresh(); receiveNotificationIntent(getIntent()); }
                     });
                 }
             }

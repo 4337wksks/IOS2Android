@@ -1,13 +1,19 @@
  
 struct GuestPoint { double x,y; };
 struct GuestSize { double width,height; };
+struct GuestInsets { double top,left,bottom,right; };
 static void ui_label_sync(Word);
+static void ui_web_sync(Word);
+static void ui_input_sync(Word);
+static void ui_scroll_input_options(Word,float *,int *);
+static void ui_scroll_input_delegate(Word,Word);
 static Word ui_alert_initialize(Word,const char *);
 static void ui_view_order_sync(Word);
 static void view_request_layout(Word,const char *);
 static void view_layout_if_needed(Word,const char *);
 static void controller_geometry(Word);
 static struct GuestSize ui_view_intrinsic_size(Word);
+static void view_set_frame(Word,const char *,struct GuestRect);
 static int ui_view_rendered(Word);
 static void ui_view_load_content(Word,const char *,const double *);
 static void ui_view_request_display(Word,const char *);
@@ -19,9 +25,9 @@ static void view_animation_change(Word);
 struct ViewState {
     Word object,parent,children,layer,controller,view,owner_window,image_name,background,presented,presenting,modal_alert,popover,navigation_bar,storyboard,nib_name,nib_bundle;
     Word navigation_item,title,prompt,left_item,right_item,back_item;
-    void *control;
+    void *control,*web,*scroll,*input;
     Word accessibility_label;
-    Word constraints;
+    Word constraints,gestures;
     struct GuestRect margins;
     struct GuestRect frame,bounds;
     double alpha,scale;
@@ -32,6 +38,7 @@ struct ViewState {
     unsigned edges,automatic_insets,defines_context,opaque_bars,clears_selection,moving_to,moving_from,opaque;
     unsigned needs_display,display_pending,display_running,display_checked;
     Method display_method;
+    Method intrinsic_method;unsigned intrinsic_epoch,intrinsic_checked;
     unsigned display_epoch;
     struct ViewState *next;
 };
@@ -47,9 +54,17 @@ static struct ViewState *view_state(Word object) {
     state->next=view_states; view_states=state;
     return state;
 }
+static Word application_windows(void) {
+    struct Sequence *windows=(void *)sequence_empty(external_class("_OBJC_CLASS_$_NSArray"));
+    for(struct ViewState *state=view_states;state;state=state->next)if(class_inherits(read_word(state->object),external_class("_OBJC_CLASS_$_UIWindow")))sequence_add(windows,"windows",state->object);
+    if(main_window.isa && !sequence_contains(windows,"windows",(Word)&main_window))sequence_add(windows,"windows",(Word)&main_window);
+    return (Word)windows;
+}
 static void view_sync_subtree(Word object) {
     struct ViewState *state=view_state(object);
     ui_label_sync(object);
+    ui_web_sync(object);
+    ui_input_sync(object);
     struct Sequence *children=(void *)state->children;
     for (size_t i=0;i<children->count;++i) view_sync_subtree(children->items[i]);
 }
@@ -65,6 +80,19 @@ static Word view_initialize(Word object,const char *selector) {
 }
 static struct GuestRect view_frame(Word object) { return view_state(object)->frame; }
 static struct GuestRect view_bounds(Word object) { return view_state(object)->bounds; }
+static struct GuestSize view_size_that_fits(Word object,const char *selector,struct GuestSize size) { struct GuestRect bounds=view_state(object)->bounds;return (struct GuestSize){bounds.width,bounds.height}; }
+static void view_size_to_fit(Word object,const char *selector) {
+    struct ViewState *state=view_state(object);Method measure=find_implementation(object,"sizeThatFits:");
+    struct GuestSize size=measure ? ((struct GuestSize (*)(Word,const char *,struct GuestSize))measure)(object,"sizeThatFits:",(struct GuestSize){state->bounds.width,state->bounds.height}) : (struct GuestSize){state->bounds.width,state->bounds.height};
+    struct GuestRect frame=state->frame;frame.width=size.width;frame.height=size.height;view_set_frame(object,selector,frame);
+}
+static void view_invalidate_intrinsic(Word object,const char *selector) { struct ViewState *state=view_state(object);view_request_layout(state->parent ? state->parent : object,selector); }
+static struct GuestSize view_intrinsic_for_layout(Word object) {
+    struct ViewState *state=view_state(object);unsigned epoch=__atomic_load_n(&method_cache_epoch,__ATOMIC_ACQUIRE);
+    if(!state->intrinsic_checked || state->intrinsic_epoch!=epoch){state->intrinsic_method=find_implementation(object,"intrinsicContentSize");state->intrinsic_checked=1;state->intrinsic_epoch=epoch;}
+    if(state->intrinsic_method && state->intrinsic_method!=(Method)ui_view_intrinsic_size)return ((struct GuestSize (*)(Word,const char *))state->intrinsic_method)(object,"intrinsicContentSize");
+    return ui_view_intrinsic_size(object);
+}
 static void view_draw_rect(Word object,const char *selector,struct GuestRect rect) {}
 static void view_background(Word object,const char *selector,Word color) { view_state(object)->background=color; view_sync_subtree(object); }
 static Word view_get_background(Word object) { return view_state(object)->background; }
@@ -475,7 +503,7 @@ static void window_set_controller(Word object,const char *selector,Word controll
         if (view_state(controller)->edges!=15) controller_geometry(controller);
     }
 }
-static void view_set_clips(Word object,const char *selector,Word clips) { view_state(object)->clips=clips!=0; ui_label_sync(object); }
+static void view_set_clips(Word object,const char *selector,Word clips) { struct ViewState *view=view_state(object);if(view->clips==(clips!=0))return;view->clips=clips!=0;view_sync_subtree(object); }
 static Word view_clips(Word object) { return view_state(object)->clips; }
 static void layer_set_masks(Word object,const char *selector,Word masks) { view_state(object)->clips=masks!=0; ui_label_sync(view_state(object)->view); }
 static void layer_set_corner(Word object,const char *selector,double radius) { view_state(object)->corner=radius; ui_label_sync(view_state(object)->view); }
@@ -542,6 +570,7 @@ static void view_animate(Word cls,const char *selector,double duration,double de
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); if (retained) _Block_release((void *)retained); stop("Android animation failed",selector); }
 }
 static void view_animate_plain(Word cls,const char *selector,double duration,Word animation,Word completion) { view_animate(cls,selector,duration,0,0,animation,completion); }
+static void view_animate_simple(Word cls,const char *selector,double duration,Word animation) { view_animate(cls,selector,duration,0,0,animation,0); }
 JNIEXPORT jstring JNICALL HOST_JNI(HostActivity_completeAnimation)(JNIEnv *env,jobject activity,jlong value,jboolean completed) {
     may_unwind=1;
     snprintf(stage,sizeof(stage),"UIView animation completion");
@@ -737,7 +766,7 @@ static void view_layout_if_needed(Word object,const char *selector) {
     double *lower=malloc(variables*sizeof(double)),*upper=malloc(variables*sizeof(double));
     struct GuestSize *intrinsic=malloc(objects->count*sizeof(*intrinsic)); const char *failure=NULL;
     if (!basis || !required || !row || !values || !lower || !upper || !intrinsic) { failure="Layout allocation failed"; goto cleanup; }
-    for (size_t i=0;i<objects->count;++i) intrinsic[i]=ui_view_intrinsic_size(objects->items[i]);
+    for (size_t i=0;i<objects->count;++i) intrinsic[i]=view_intrinsic_for_layout(objects->items[i]);
 #define INSERT_LAYOUT_ROW(storage,mandatory) do { if (!layout_equation(storage,variables,row,mandatory)) { failure="Inconsistent required layout equation"; goto cleanup; } } while (0)
     for (unsigned i=0;i<variables;++i) { lower[i]=-INFINITY; upper[i]=INFINITY; }
     JNIEnv *env=attached_environment(selector); static jmethodID direction;
@@ -988,8 +1017,21 @@ static void finish_application_lifecycle(void) {
     application_lifecycle_start();
 }
 
+static void view_host_geometry(Word object,float metrics[11],int options[3]) {
+    struct ViewState *view=view_state(object);double scale=screen_scale(),x=view->frame.x,y=view->frame.y,alpha=view->alpha;int visible=!view->hidden,enabled=view->interaction;
+    for(Word parent=view->parent;parent;parent=view_state(parent)->parent){struct ViewState *ancestor=view_state(parent);x+=ancestor->frame.x-ancestor->bounds.x;y+=ancestor->frame.y-ancestor->bounds.y;alpha*=ancestor->alpha;visible&=!ancestor->hidden;enabled&=ancestor->interaction;}
+    struct GuestRect clip=screen_bounds();double px=x-view->frame.x,py=y-view->frame.y;
+    for(Word parent=view->parent;parent;parent=view_state(parent)->parent){struct ViewState *ancestor=view_state(parent);px+=ancestor->bounds.x;py+=ancestor->bounds.y;
+        if(ancestor->clips){double right=fmin(clip.x+clip.width,px+ancestor->frame.width),bottom=fmin(clip.y+clip.height,py+ancestor->frame.height);clip.x=fmax(clip.x,px);clip.y=fmax(clip.y,py);clip.width=fmax(0,right-clip.x);clip.height=fmax(0,bottom-clip.y);}
+        px-=ancestor->frame.x;py-=ancestor->frame.y;
+    }
+    double left=fmax(x,clip.x),top=fmax(y,clip.y),right=fmin(x+view->frame.width,clip.x+clip.width),bottom=fmin(y+view->frame.height,clip.y+clip.height);
+    float values[]={(float)(x*scale),(float)(y*scale),(float)(view->frame.width*scale),(float)(view->frame.height*scale),(float)alpha,(float)(view->layer ? view_state(view->layer)->z : 0),(float)view_window_level(object),(float)((left-x)*scale),(float)((top-y)*scale),(float)(fmax(0,right-left)*scale),(float)(fmax(0,bottom-top)*scale)};
+    memcpy(metrics,values,sizeof(values));options[0]=visible && alpha>0 && right>left && bottom>top;options[1]=view_window(object)!=0;options[2]=enabled;
+}
 static Method views_method(Word object,const char *selector,const char *receiver,int class_receiver) {
     if (!receiver) return NULL;
+    if(!class_receiver && object==(Word)&application && !strcmp(selector,"windows"))return (Method)application_windows;
     Word cls=class_receiver ? object : read_word(object);
     const char *base=external_base(cls);
     int view=class_inherits(cls,external_class("_OBJC_CLASS_$_UIView")) || (base && !strcmp(base,"_OBJC_CLASS_$__UILayoutGuide"));
@@ -1015,6 +1057,7 @@ static Method views_method(Word object,const char *selector,const char *receiver
         if (view && !strcmp(selector,"layerClass")) return (Method)default_layer_class;
         if (view && !strcmp(selector,"animateWithDuration:delay:options:animations:completion:")) return (Method)view_animate;
         if (view && !strcmp(selector,"animateWithDuration:animations:completion:")) return (Method)view_animate_plain;
+        if (view && !strcmp(selector,"animateWithDuration:animations:")) return (Method)view_animate_simple;
         return NULL;
     }
     if (navigation) {
@@ -1099,6 +1142,10 @@ static Method views_method(Word object,const char *selector,const char *receiver
         if (!strcmp(selector,"zPosition")) return (Method)layer_z;
     }
     if (!view) return NULL;
+    if(!strcmp(selector,"intrinsicContentSize"))return (Method)ui_view_intrinsic_size;
+    if(!strcmp(selector,"invalidateIntrinsicContentSize"))return (Method)view_invalidate_intrinsic;
+    if(!strcmp(selector,"sizeThatFits:"))return (Method)view_size_that_fits;
+    if(!strcmp(selector,"sizeToFit"))return (Method)view_size_to_fit;
     if (!strcmp(selector,"drawRect:") && !class_inherits(cls,external_class("_OBJC_CLASS_$_UILabel"))) return (Method)view_draw_rect;
     if (!strcmp(selector,"setNeedsDisplay")) return (Method)ui_view_request_display;
     if (!strcmp(selector,"setOpaque:")) return (Method)view_set_opaque;

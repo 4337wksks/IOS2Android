@@ -1,15 +1,16 @@
- 
+static int audio_prepare_resource(Word token,const char *path){
+    struct HostObject *data=(void *)data_from_file(external_class("_OBJC_CLASS_$_NSData"),"Audio resource",copy_string(path));if(!data)return 0;
+    if(data->content[0]>INT32_MAX){free(data);errno=EFBIG;return 0;}
+    JNIEnv *env=attached_environment("Audio resource");jclass type=(*env)->GetObjectClass(env,activity);jmethodID prepare=(*env)->GetMethodID(env,type,"prepareAudio","(J[B)Z");
+    jbyteArray bytes=(*env)->NewByteArray(env,(jsize)data->content[0]);if(bytes)(*env)->SetByteArrayRegion(env,bytes,0,(jsize)data->content[0],(const jbyte *)data_buffer(data));free(data);
+    int result=bytes && (*env)->CallBooleanMethod(env,activity,prepare,(jlong)token,bytes);if(bytes)(*env)->DeleteLocalRef(env,bytes);(*env)->DeleteLocalRef(env,type);return result;
+}
 static Word audio_player_init(Word object,const char *selector,struct HostObject *url,Word *error) {
     if (error) *error=0;
     if (!url || !url->content[1]) return 0;
-    char *path=native_path(string_bytes(url_path(url),selector));
-    if (!path) { file_failure(error,"AVAudioPlayer",errno); return 0; }
+    int prepared=audio_prepare_resource(object,string_bytes(url_path(url),selector));
     JNIEnv *env=attached_environment(selector);
     jclass type=(*env)->GetObjectClass(env,activity);
-    jmethodID prepare=(*env)->GetMethodID(env,type,"prepareAudio","(JLjava/lang/String;)Z");
-    jstring filename=(*env)->NewStringUTF(env,path);
-    int prepared=(*env)->CallBooleanMethod(env,activity,prepare,(jlong)object,filename);
-    (*env)->DeleteLocalRef(env,filename); free(path);
     if (!prepared && error) {
         jmethodID last_error=(*env)->GetMethodID(env,type,"audioError","()Ljava/lang/String;");
         jstring message=(*env)->CallObjectMethod(env,activity,last_error);
@@ -103,15 +104,9 @@ static Word system_sound_next=0x10000;
 static int system_sound_create(Word url,uint32_t *output) {
     if (!output || !url) return -50;
     *output=0;
-    char *path=native_path(string_bytes(url_path((void *)url),"AudioServicesCreateSystemSoundID"));
-    if (!path) return -1500;
     Word id=__atomic_fetch_add(&system_sound_next,1,__ATOMIC_RELAXED);
-    if (id>INT32_MAX) { free(path); return -1500; }
-    JNIEnv *env=attached_environment("AudioServicesCreateSystemSoundID"); jclass type=(*env)->GetObjectClass(env,activity);
-    jmethodID prepare=(*env)->GetMethodID(env,type,"prepareAudio","(JLjava/lang/String;)Z");
-    jstring filename=(*env)->NewStringUTF(env,path); free(path);
-    int prepared=filename && prepare && (*env)->CallBooleanMethod(env,activity,prepare,-(jlong)id,filename);
-    if (filename) (*env)->DeleteLocalRef(env,filename); (*env)->DeleteLocalRef(env,type);
+    if (id>INT32_MAX) return -1500;
+    int prepared=audio_prepare_resource((Word)-(intptr_t)id,string_bytes(url_path((void *)url),"AudioServicesCreateSystemSoundID"));JNIEnv *env=attached_environment("AudioServicesCreateSystemSoundID");
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); return -1500; }
     if (!prepared) return -1500;
     *output=(uint32_t)id; return 0;

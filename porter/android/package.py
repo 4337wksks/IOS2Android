@@ -131,7 +131,7 @@ def build_host(context, revision, fonts, resources, launch_screen):
             code = re.sub(r"\s*// DEVELOPMENT_BEGIN.*?// DEVELOPMENT_END", "", code, flags=re.S)
         (sources / path.name).write_text(code, encoding="utf-8")
     fields = dict(
-        BUNDLE_REVISION=revision,
+        PACKAGE_REVISION=revision,
         BUNDLE_NAME=context.identity.directory,
         APP_NAME=context.identity.display_name,
         RUNTIME_PREFERENCES=context.storage["preferences"],
@@ -256,6 +256,7 @@ def build_apk(context, source, manifest, resources, catalog, overlays, native, d
     if not context.host.get("libraries"):
         run(context, tools["sdk"] / "aapt.exe", "package", "-f", "-M", manifest, "-I", tools["platform"], "-S", resources, "-F", assets)
     with zipfile.ZipFile(assets, "a") as package:
+        package.write(work / "shaders.bin", "assets/i2a/shaders.bin", compress_type=zipfile.ZIP_STORED)
         for directory in sorted((work / "android-libraries").glob("*")):
             for path in sorted((directory / "assets").rglob("*")):
                 if path.is_file():
@@ -313,7 +314,7 @@ def build_apk(context, source, manifest, resources, catalog, overlays, native, d
             "assets/licenses/Imagination-PVRTC.txt",
             compress_type=zipfile.ZIP_DEFLATED,
         )
-    run(context, tools["sdk"] / "zipalign.exe", "-f", 4, unsigned, "aligned.apk")
+    run(context, tools["sdk"] / "zipalign.exe", "-f", 16384, unsigned, "aligned.apk")
     signer = tools["sdk"] / "lib/apksigner.jar"
     sign = context.signing
     run(
@@ -328,6 +329,8 @@ def build_apk(context, source, manifest, resources, catalog, overlays, native, d
         "pass:" + sign["password"],
         "--v4-signing-enabled",
         "false",
+        "--alignment-preserved",
+        "true",
         "--out",
         "candidate.apk",
         "aligned.apk",

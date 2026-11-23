@@ -107,6 +107,10 @@ static double darwin_exp10(double value) { return pow(10.0,value); }
 static __attribute__((noreturn)) void darwin_assert(const char *function,const char *file,int line,const char *expression) {
     char detail[420];
     snprintf(detail,sizeof(detail),"%s at %s:%d: %s",function ? function : "?",file ? file : "?",line,expression ? expression : "?");
+    void *frames[32];
+    int count=darwin_backtrace(frames,COUNT(frames));
+    for (int i=0;i<count;++i) if (in_image((Word)frames[i]))
+        LOG("Assertion guest frame %d: 0x%lx",i,(Word)frames[i]-aslr+GUEST_IMAGE_BASE);
     stop("Original assertion failed",detail);
 }
 static void darwin_dcache_flush(void *address,size_t length) {

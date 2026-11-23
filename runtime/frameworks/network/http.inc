@@ -281,6 +281,59 @@ static Word core_http_create_copy(Word allocator,Word object) {
     return result;
 }
 static Word core_http_type(void) { return (Word)&http_message_tag; }
+static Word proxy_settings(void) {
+    JNIEnv *env=attached_environment("System proxy settings");
+    static jmethodID query;
+    jmethodID method=__atomic_load_n(&query,__ATOMIC_ACQUIRE);
+    if(!method){jclass cls=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,cls,"systemProxySettings","()Ljava/lang/String;");(*env)->DeleteLocalRef(env,cls);__atomic_store_n(&query,method,__ATOMIC_RELEASE);}
+    jstring json=method ? (*env)->CallObjectMethod(env,activity,method) : NULL;
+    if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);if(json)(*env)->DeleteLocalRef(env,json);return 0;}
+    if(!json)return 0;
+    const char *bytes=(*env)->GetStringUTFChars(env,json,NULL);
+    Word data=bytes ? data_with_bytes(external_class("_OBJC_CLASS_$_NSData"),"System proxy settings",bytes,strlen(bytes)) : 0;
+    if(bytes)(*env)->ReleaseStringUTFChars(env,json,bytes);(*env)->DeleteLocalRef(env,json);
+    return data ? json_parse(0,"System proxy settings",(void *)data,0,NULL) : 0;
+}
+static Word proxy_value(struct GuestMap *settings,const char *key) { return map_get(settings,"Proxy settings",copy_string(key)); }
+static int proxy_enabled(struct GuestMap *settings,const char *key) { Word value=proxy_value(settings,key);return value && numeric_bool((void *)value); }
+static Word proxy_descriptor(const char *type,Word host,Word port) {
+    struct GuestMap *proxy=(void *)empty_map(external_class("_OBJC_CLASS_$_NSDictionary"));
+    map_set(proxy,"Proxy settings",copy_string(type),copy_string("kCFProxyTypeKey"));
+    if(host)map_set(proxy,"Proxy settings",host,copy_string("kCFProxyHostNameKey"));
+    if(port)map_set(proxy,"Proxy settings",port,copy_string("kCFProxyPortNumberKey"));
+    return (Word)proxy;
+}
+static int proxy_host_match(const char *host,const char *pattern) {
+    const char *star=NULL,*retry=NULL;
+    while(*host){if(*pattern=='*'){star=++pattern;retry=host;}else if(*pattern=='?' || core_http_lower((unsigned char)*host)==core_http_lower((unsigned char)*pattern)){++host;++pattern;}else if(star){pattern=star;host=++retry;}else return 0;}
+    while(*pattern=='*')++pattern;return !*pattern;
+}
+static Word proxy_for_url(struct HostObject *url,struct GuestMap *settings) {
+    if(!url || !settings)return 0;
+    Word host=url_component(url,"host"),scheme=url_component(url,"scheme");if(!host || !scheme)return 0;
+    const char *name=string_bytes(host,"Proxy host"),*protocol=string_bytes(scheme,"Proxy scheme");
+    struct Sequence *result=(void *)sequence_empty(external_class("_OBJC_CLASS_$_NSArray"));
+    int bypass=proxy_enabled(settings,"ExcludeSimpleHostnames") && !strchr(name,'.') && !strchr(name,':');
+    struct Sequence *exceptions=(void *)proxy_value(settings,"ExceptionsList");
+    if(exceptions)for(size_t i=0;i<exceptions->count && !bypass;++i)bypass=proxy_host_match(name,string_bytes(exceptions->items[i],"Proxy exception"));
+    Word descriptor=0;
+    if(!bypass && proxy_enabled(settings,"ProxyAutoConfigEnable")){
+        Word script=proxy_value(settings,"ProxyAutoConfigJavaScript"),pac=proxy_value(settings,"ProxyAutoConfigURLString");
+        if(script || pac){descriptor=proxy_descriptor(script ? "kCFProxyTypeAutoConfigurationJavaScript" : "kCFProxyTypeAutoConfigurationURL",0,0);
+            map_set((void *)descriptor,"Proxy settings",script ? script : url_from_string(external_class("_OBJC_CLASS_$_NSURL"),"Proxy PAC",pac),copy_string(script ? "kCFProxyAutoConfigurationJavaScriptKey" : "kCFProxyAutoConfigurationURLKey"));}
+    }
+    if(!bypass && !descriptor){
+        const char *prefix=!strcasecmp(protocol,"https") ? "HTTPS" : !strcasecmp(protocol,"http") ? "HTTP" : "";
+        char enabled[24],address[24],port_key[24];snprintf(enabled,sizeof(enabled),"%sEnable",prefix);snprintf(address,sizeof(address),"%sProxy",prefix);snprintf(port_key,sizeof(port_key),"%sPort",prefix);
+        if(*prefix && proxy_enabled(settings,enabled)){Word address_value=proxy_value(settings,address),port=proxy_value(settings,port_key);if(address_value && port && numeric_integer((void *)port)>0 && numeric_integer((void *)port)<=65535)descriptor=proxy_descriptor("kCFProxyTypeHTTP",address_value,port);}
+        if(!descriptor && proxy_enabled(settings,"SOCKSEnable")){Word address_value=proxy_value(settings,"SOCKSProxy"),port=proxy_value(settings,"SOCKSPort");if(address_value && port && numeric_integer((void *)port)>0 && numeric_integer((void *)port)<=65535)descriptor=proxy_descriptor("kCFProxyTypeSOCKS",address_value,port);}
+    }
+    sequence_add(result,"Proxy settings",descriptor ? descriptor : proxy_descriptor("kCFProxyTypeNone",0,0));return (Word)result;
+}
+static Word proxy_from_script(Word script,Word url,Word *error) {
+    if(error)*error=error_with_domain(external_class("_OBJC_CLASS_$_NSError"),"PAC evaluation",copy_string("kCFErrorDomainCFNetwork"),script && url ? 308 : 303,0);
+    return 0;
+}
 static Word resolve_http_message_import(const char *name) {
 #define HTTP_MESSAGE(api,fn) if (!strcmp(name,"_" #api)) return (Word)fn
     HTTP_MESSAGE(CFHTTPMessageCreateEmpty,core_http_new); HTTP_MESSAGE(CFHTTPMessageCreateRequest,core_http_create_request);
@@ -293,12 +346,12 @@ static Word resolve_http_message_import(const char *name) {
     HTTP_MESSAGE(CFHTTPMessageCopyVersion,core_http_copy_version); HTTP_MESSAGE(CFHTTPMessageCopyRequestMethod,core_http_copy_method);
     HTTP_MESSAGE(CFHTTPMessageCopyRequestURL,core_http_copy_url); HTTP_MESSAGE(CFHTTPMessageCopyResponseStatusLine,core_http_copy_status_line);
     HTTP_MESSAGE(CFHTTPMessageGetTypeID,core_http_type);
+    HTTP_MESSAGE(CFNetworkCopySystemProxySettings,proxy_settings);HTTP_MESSAGE(CFNetworkCopyProxiesForURL,proxy_for_url);
+    HTTP_MESSAGE(CFNetworkCopyProxiesForAutoConfigurationScript,proxy_from_script);
 #undef HTTP_MESSAGE
     return 0;
 }
 
-/* Immutable cookie values and RFC6265 request headers. Storage/transport jars
- * remain with their existing owner; this does not fabricate a shared jar. */
 struct CoreCookie { Word isa,properties,name,value,domain,path,expires; unsigned secure,http_only; Word version; };
 static Word cookie_alloc(Word cls) {
     struct CoreCookie *cookie=calloc(1,sizeof(*cookie)); if (!cookie) stop("Allocation failed","NSHTTPCookie");
@@ -332,6 +385,81 @@ static Word cookie_init(struct CoreCookie *cookie,const char *selector,struct Gu
     return (Word)cookie;
 }
 static Word cookie_from_properties(Word cls,const char *selector,struct GuestMap *properties) { return cookie_init((void *)cookie_alloc(cls),selector,properties); }
+static struct HostObject shared_cookie_storage;
+static pthread_mutex_t cookie_storage_mutex=PTHREAD_MUTEX_INITIALIZER;
+static Word cookie_storage_shared(Word cls) {
+    pthread_mutex_lock(&cookie_storage_mutex);
+    if(!shared_cookie_storage.isa){shared_cookie_storage.isa=cls;shared_cookie_storage.content[0]=2;shared_cookie_storage.content[1]=1;}
+    pthread_mutex_unlock(&cookie_storage_mutex);return (Word)&shared_cookie_storage;
+}
+static Word cookie_storage_init(Word object) {
+    struct HostObject *storage=(void *)object;pthread_mutex_lock(&cookie_storage_mutex);
+    if(!storage->content[1]){storage->content[0]=2;storage->content[1]=1;}
+    pthread_mutex_unlock(&cookie_storage_mutex);return object;
+}
+static Word cookie_storage_transport(Word object,const char *operation,Word payload) {
+    JNIEnv *env=attached_environment("Cookie storage");static jmethodID command;
+    jmethodID method=__atomic_load_n(&command,__ATOMIC_ACQUIRE);
+    if(!method){jclass cls=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,cls,"cookieCommand","(JLjava/lang/String;Ljava/lang/String;)Ljava/lang/String;");(*env)->DeleteLocalRef(env,cls);__atomic_store_n(&command,method,__ATOMIC_RELEASE);}
+    Word encoded=json_encode(0,"Cookie storage",payload,0,NULL);struct HostObject *bytes=(void *)encoded;
+    jstring data=http_java_string(env,text_decode(external_class("_OBJC_CLASS_$_NSString"),(void *)data_buffer(bytes),bytes->content[0],4)),action=(*env)->NewStringUTF(env,operation);
+    jstring result=(*env)->CallObjectMethod(env,activity,method,(jlong)cookie_storage_init(object),action,data);
+    (*env)->DeleteLocalRef(env,action);(*env)->DeleteLocalRef(env,data);
+    if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);if(result)(*env)->DeleteLocalRef(env,result);stop("Cookie storage operation failed",operation);}
+    Word answer=result ? encoded_string(string_from_java(env,result,"Cookie storage"),"Cookie storage",4) : 0;
+    if(result)(*env)->DeleteLocalRef(env,result);return answer ? json_parse(0,"Cookie storage",(void *)answer,0,NULL) : 0;
+}
+static Word cookie_storage_list(Word object,const char *selector,Word url) {
+    struct GuestMap *payload=(void *)empty_map(external_class("_OBJC_CLASS_$_NSDictionary"));
+    if(url)map_set(payload,selector,url_absolute((void *)url,selector),copy_string("url"));
+    struct Sequence *properties=(void *)cookie_storage_transport(object,url ? "url" : "cookies",(Word)payload);
+    if(!properties)return 0;
+    struct Sequence *cookies=(void *)sequence_empty(external_class("_OBJC_CLASS_$_NSArray"));
+    for(size_t i=0;i<properties->count;++i){struct GuestMap *map=(void *)properties->items[i];Word expires=map_get(map,selector,copy_string("Expires"));
+        if(expires)map_set(map,selector,date_epoch(external_class("_OBJC_CLASS_$_NSDate"),selector,numeric_double((void *)expires)),copy_string("Expires"));
+        Word cookie=cookie_from_properties(external_class("_OBJC_CLASS_$_NSHTTPCookie"),selector,map);if(cookie)sequence_add(cookies,selector,cookie);
+    }
+    return (Word)cookies;
+}
+static Word cookie_storage_all(Word object,const char *selector) { return cookie_storage_list(object,selector,0); }
+static void cookie_storage_change(Word object,const char *selector,struct CoreCookie *cookie) {
+    if(!cookie || cookie->isa!=external_class("_OBJC_CLASS_$_NSHTTPCookie"))stop("Invalid cookie",selector);
+    struct GuestMap *payload=(void *)empty_map(external_class("_OBJC_CLASS_$_NSDictionary"));
+    const char *keys[]={"Name","Value","Domain","Path"};Word values[]={cookie->name,cookie->value,cookie->domain,cookie->path};
+    for(size_t i=0;i<COUNT(keys);++i)map_set(payload,selector,values[i],copy_string(keys[i]));
+    map_set(payload,selector,number_bool(external_class("_OBJC_CLASS_$_NSNumber"),0,cookie->secure),copy_string("Secure"));
+    map_set(payload,selector,number_bool(external_class("_OBJC_CLASS_$_NSNumber"),0,cookie->http_only),copy_string("HttpOnly"));
+    map_set(payload,selector,number_integer(cookie->version),copy_string("Version"));
+    if(cookie->expires)map_set(payload,selector,real_number_factory(external_class("_OBJC_CLASS_$_NSNumber"),0,date_seconds(cookie->expires)),copy_string("Expires"));
+    cookie_storage_transport(object,!strcmp(selector,"deleteCookie:") ? "delete" : "set",(Word)payload);
+}
+static Word cookie_storage_policy(Word object) { cookie_storage_init(object);return __atomic_load_n(&((struct HostObject *)object)->content[0],__ATOMIC_ACQUIRE); }
+static void cookie_storage_set_policy(Word object,const char *selector,Word policy) {
+    if(policy>2)stop("Invalid cookie acceptance policy",selector);
+    struct GuestMap *payload=(void *)empty_map(external_class("_OBJC_CLASS_$_NSDictionary"));map_set(payload,selector,number_integer(policy),copy_string("policy"));
+    cookie_storage_transport(object,"policy",(Word)payload);__atomic_store_n(&((struct HostObject *)object)->content[0],policy,__ATOMIC_RELEASE);
+}
+static void cookie_storage_set_many(Word object,const char *selector,struct Sequence *cookies,struct HostObject *url,struct HostObject *main_url) {
+    if(!cookies || !url)return;Word policy=cookie_storage_policy(object);
+    if(policy==1)return;
+    if(policy==2){if(!main_url)return;Word host=url_component(url,"host"),main_host=url_component(main_url,"host");if(!host || !main_host)return;
+        const char *a=string_bytes(host,selector),*b=string_bytes(main_host,selector);size_t x=strlen(a),y=strlen(b);
+        if(strcasecmp(a,b) && !(x>y && a[x-y-1]=='.' && !strcasecmp(a+x-y,b)))return;
+    }
+    for(size_t i=0;i<cookies->count;++i)cookie_storage_change(object,"setCookie:",(void *)cookies->items[i]);
+}
+static Method cookie_storage_method(Word object,const char *selector,const char *receiver,int class_receiver) {
+    if(!receiver || strcmp(receiver,"_OBJC_CLASS_$_NSHTTPCookieStorage"))return NULL;
+    if(class_receiver){if(!strcmp(selector,"sharedHTTPCookieStorage"))return (Method)cookie_storage_shared;}
+    else{
+        if(!strcmp(selector,"init"))return (Method)cookie_storage_init;
+        if(!strcmp(selector,"cookies"))return (Method)cookie_storage_all;if(!strcmp(selector,"cookiesForURL:"))return (Method)cookie_storage_list;
+        if(!strcmp(selector,"setCookie:") || !strcmp(selector,"deleteCookie:"))return (Method)cookie_storage_change;
+        if(!strcmp(selector,"cookieAcceptPolicy"))return (Method)cookie_storage_policy;if(!strcmp(selector,"setCookieAcceptPolicy:"))return (Method)cookie_storage_set_policy;
+        if(!strcmp(selector,"setCookies:forURL:mainDocumentURL:"))return (Method)cookie_storage_set_many;
+    }
+    return NULL;
+}
 static Word cookie_get(struct CoreCookie *cookie,const char *selector) {
     if (!strcmp(selector,"name")) return cookie->name;
     if (!strcmp(selector,"value")) return cookie->value;
@@ -341,6 +469,7 @@ static Word cookie_get(struct CoreCookie *cookie,const char *selector) {
     if (!strcmp(selector,"expiresDate")) return cookie->expires;
     if (!strcmp(selector,"isSecure")) return cookie->secure;
     if (!strcmp(selector,"isHTTPOnly")) return cookie->http_only;
+    if (!strcmp(selector,"isSessionOnly")) return !cookie->expires;
     return cookie->version;
 }
 static Word cookie_request_headers(Word cls,const char *selector,struct Sequence *cookies) {
@@ -367,9 +496,18 @@ struct ResponseCacheEntry { Word key,value; uint64_t hash; size_t memory,disk; s
 struct ResponseCache { Word object; size_t memory_capacity,disk_capacity,memory_used,disk_used; char *directory; pthread_mutex_t mutex; struct ResponseCacheEntry *first,*last; };
 static Word shared_response_cache;
 static pthread_mutex_t shared_cache_mutex=PTHREAD_MUTEX_INITIALIZER;
+#define CACHE_LOCK(c) \
+    pthread_mutex_lock(&(c)->mutex); \
+    struct GuestCallBoundary cache_boundary={.previous=active_guest_call_boundary}; \
+    active_guest_call_boundary=&cache_boundary; \
+    if(setjmp(cache_boundary.environment)){ \
+        active_guest_call_boundary=cache_boundary.previous;pthread_mutex_unlock(&(c)->mutex); \
+        char failure[sizeof(status)];memcpy(failure,status,sizeof(failure));stop("URL cache operation failed",failure); \
+    }
+#define CACHE_UNLOCK(c) active_guest_call_boundary=cache_boundary.previous;pthread_mutex_unlock(&(c)->mutex)
 static Word cached_response_init(Word object,const char *selector,Word response,Word data,Word info,Word policy) {
     if(!response || !data || policy>2)stop("Invalid cached response",selector);
-    struct CachedResponse *r=(void *)object;r->response=response;r->data=data_copy(data,"copy");r->info=info ? map_copy((void *)info,"copy") : 0;r->policy=policy;return object;
+    struct CachedResponse *r=(void *)object;r->response=cf_retain(response);r->data=data_copy(data,"copy");r->info=info ? map_copy((void *)info,"copy") : 0;r->policy=policy;return object;
 }
 static Word cached_response_init_plain(Word object,const char *selector,Word response,Word data) { return cached_response_init(object,selector,response,data,0,0); }
 static Word cached_response_property(struct CachedResponse *r,const char *selector) { return !strcmp(selector,"response") ? r->response : !strcmp(selector,"data") ? r->data : !strcmp(selector,"userInfo") ? r->info : r->policy; }
@@ -441,36 +579,39 @@ static Word response_cache_shared(Word cls,const char *selector) {
 static void response_cache_set_shared(Word cls,const char *selector,Word cache) { pthread_mutex_lock(&shared_cache_mutex);shared_response_cache=cache;pthread_mutex_unlock(&shared_cache_mutex); }
 static Word response_cache_get(Word object,const char *selector,Word request) {
     Word key=cache_request_key(request);if(!key)return 0;uint64_t hash=cache_key_hash(key);struct ResponseCache *c=response_cache(object);Word result=0;
-    pthread_mutex_lock(&c->mutex);
+    CACHE_LOCK(c);
     for(struct ResponseCacheEntry *e=c->first;e;e=e->next)if(e->hash==hash) {
         Word record=0;if(!e->value && e->disk){Word bytes=data_from_file(external_class("_OBJC_CLASS_$_NSData"),selector,cache_filename(c,hash));record=bytes ? property_list_decode(0,selector,(void *)bytes,0,NULL,NULL) : 0;if(record && !e->key)e->key=map_get((void *)record,selector,copy_string("key"));}
         if(!cache_key_equal(e->key,key))continue;
         result=e->value;if(!result && record)result=cache_decode_response(map_get((void *)record,selector,copy_string("value")));
-        if(result){cache_touch(c,e);size_t amount=read_word(((struct CachedResponse *)result)->data+8);if(!e->value && amount<=c->memory_capacity){e->value=result;e->memory=amount;c->memory_used+=amount;cache_trim(c);}}break;
+        if(result){cf_retain(result);cache_touch(c,e);size_t amount=read_word(((struct CachedResponse *)result)->data+8);if(amount<SIZE_MAX-sizeof(struct CachedResponse))amount+=sizeof(struct CachedResponse);else amount=SIZE_MAX;if(!e->value && amount<=c->memory_capacity && amount<=SIZE_MAX-c->memory_used){e->value=cf_retain(result);e->memory=amount;c->memory_used+=amount;cache_trim(c);}}break;
     }
-    pthread_mutex_unlock(&c->mutex);cf_release(key);return result;
+    CACHE_UNLOCK(c);cf_release(key);return result;
 }
 static void response_cache_store(Word object,const char *selector,Word value,Word request) {
-    Word key=cache_request_key(request);if(!key || !value)return;struct CachedResponse *r=(void *)value;struct ResponseCache *c=response_cache(object);uint64_t hash=cache_key_hash(key);size_t amount=read_word(r->data+8);
+    if(!value)return;Word key=cache_request_key(request);if(!key)return;struct CachedResponse *r=(void *)value;struct ResponseCache *c=response_cache(object);uint64_t hash=cache_key_hash(key);size_t amount=read_word(r->data+8);if(amount<SIZE_MAX-sizeof(*r))amount+=sizeof(*r);else amount=SIZE_MAX;
     Word encoded=r->policy==0 && c->disk_capacity ? cache_encode_response(r) : 0;
-    pthread_mutex_lock(&c->mutex);
+    CACHE_LOCK(c);
     for(struct ResponseCacheEntry *e=c->first,*next;e;e=next){next=e->next;if(e->hash==hash)cache_unlink_entry(c,e);}
-    if(r->policy==2){pthread_mutex_unlock(&c->mutex);cf_release(key);return;}
-    struct ResponseCacheEntry *e=calloc(1,sizeof(*e));if(!e){pthread_mutex_unlock(&c->mutex);stop("Allocation failed",selector);}e->key=key;e->hash=hash;
-    if(amount<=c->memory_capacity){e->value=value;e->memory=amount;c->memory_used+=amount;cf_retain(value);}
+    if(r->policy==2){CACHE_UNLOCK(c);cf_release(key);return;}
+    struct ResponseCacheEntry *e=calloc(1,sizeof(*e));if(!e)stop("Allocation failed",selector);e->key=key;e->hash=hash;
+    if(amount<=c->memory_capacity && amount<=SIZE_MAX-c->memory_used){e->value=value;e->memory=amount;c->memory_used+=amount;cf_retain(value);}
     if(encoded){struct GuestMap *record=(void *)empty_map(external_class("_OBJC_CLASS_$_NSDictionary"));map_set(record,selector,key,copy_string("key"));map_set(record,selector,encoded,copy_string("value"));Word bytes=property_list_encode(0,selector,(Word)record,200,0,NULL);
         if(bytes && read_word(bytes+8)<=c->disk_capacity && data_write_file((void *)bytes,selector,cache_filename(c,hash),1,NULL)){e->disk=read_word(bytes+8);c->disk_used+=e->disk;}}
-    e->next=c->first;if(c->first)c->first->previous=e;else c->last=e;c->first=e;cache_trim(c);
+    e->next=c->first;if(c->first)c->first->previous=e;else c->last=e;c->first=e;
     if(!e->memory && !e->disk)cache_unlink_entry(c,e);
-    pthread_mutex_unlock(&c->mutex);
+    cache_trim(c);
+    CACHE_UNLOCK(c);
 }
 static void response_cache_remove(Word object,const char *selector,Word request) {
     struct ResponseCache *c=response_cache(object);Word key=request ? cache_request_key(request) : 0;uint64_t hash=key ? cache_key_hash(key) : 0;
-    pthread_mutex_lock(&c->mutex);for(struct ResponseCacheEntry *e=c->first,*next;e;e=next){next=e->next;if(!request || (key && e->hash==hash))cache_unlink_entry(c,e);}pthread_mutex_unlock(&c->mutex);if(key)cf_release(key);
+    CACHE_LOCK(c);for(struct ResponseCacheEntry *e=c->first,*next;e;e=next){next=e->next;if(!request || (key && e->hash==hash))cache_unlink_entry(c,e);}CACHE_UNLOCK(c);if(key)cf_release(key);
 }
 static void response_cache_clear(Word object,const char *selector) { response_cache_remove(object,selector,0); }
 static Word response_cache_capacity(Word object,const char *selector) { struct ResponseCache *c=response_cache(object);pthread_mutex_lock(&c->mutex);Word value=!strcmp(selector,"memoryCapacity") ? c->memory_capacity : !strcmp(selector,"diskCapacity") ? c->disk_capacity : !strcmp(selector,"currentMemoryUsage") ? c->memory_used : c->disk_used;pthread_mutex_unlock(&c->mutex);return value; }
-static void response_cache_set_capacity(Word object,const char *selector,size_t size) { struct ResponseCache *c=response_cache(object);pthread_mutex_lock(&c->mutex);if(!strcmp(selector,"setMemoryCapacity:"))c->memory_capacity=size;else c->disk_capacity=size;cache_trim(c);pthread_mutex_unlock(&c->mutex); }
+static void response_cache_set_capacity(Word object,const char *selector,size_t size) { struct ResponseCache *c=response_cache(object);CACHE_LOCK(c);if(!strcmp(selector,"setMemoryCapacity:"))c->memory_capacity=size;else c->disk_capacity=size;cache_trim(c);CACHE_UNLOCK(c); }
+#undef CACHE_LOCK
+#undef CACHE_UNLOCK
 static Method response_cache_method(Word object,const char *selector,const char *receiver,int class_receiver) {
     if(!receiver)return NULL;
     if(!strcmp(receiver,"_OBJC_CLASS_$_NSCachedURLResponse") && !class_receiver){if(!strcmp(selector,"initWithResponse:data:userInfo:storagePolicy:"))return (Method)cached_response_init;if(!strcmp(selector,"initWithResponse:data:"))return (Method)cached_response_init_plain;
@@ -493,7 +634,7 @@ static Method cookie_method(Word object,const char *selector,const char *receive
     } else {
         if (!strcmp(selector,"initWithProperties:")) return (Method)cookie_init;
         if (!strcmp(selector,"copy") || !strcmp(selector,"copyWithZone:")) return (Method)identity;
-        if (!strcmp(selector,"name") || !strcmp(selector,"value") || !strcmp(selector,"domain") || !strcmp(selector,"path") || !strcmp(selector,"properties") || !strcmp(selector,"expiresDate") || !strcmp(selector,"isSecure") || !strcmp(selector,"isHTTPOnly") || !strcmp(selector,"version")) return (Method)cookie_get;
+        if (!strcmp(selector,"name") || !strcmp(selector,"value") || !strcmp(selector,"domain") || !strcmp(selector,"path") || !strcmp(selector,"properties") || !strcmp(selector,"expiresDate") || !strcmp(selector,"isSecure") || !strcmp(selector,"isHTTPOnly") || !strcmp(selector,"isSessionOnly") || !strcmp(selector,"version")) return (Method)cookie_get;
     }
     return NULL;
 }

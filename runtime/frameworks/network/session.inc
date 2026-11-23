@@ -330,12 +330,13 @@ static void session_enumerate(struct Session *session,const char *selector,Word 
 }
 JNIEXPORT jlongArray JNICALL HOST_JNI(HttpTransport_settings)(JNIEnv *env,jclass cls,jlong token) {
     struct ConnectionState *connection=(void *)token; struct SessionTask *task=(void *)connection->session_task;
-    jlong values[4]={0,6,604800000,1};
+    jlong values[6]={0,6,604800000,1,(jlong)cookie_storage_shared(external_class("_OBJC_CLASS_$_NSHTTPCookieStorage")),2};
     if (task) {
         struct SessionConfig *config=configuration_values((void *)task->session->configuration);
         values[0]=(jlong)task->session; values[1]=config->maximum_connections; values[2]=(jlong)(config->resource_timeout*1000); values[3]=config->cookies;
+        values[4]=config->cookie_storage;values[5]=config->cookie_policy;
     }
-    jlongArray result=(*env)->NewLongArray(env,4); if (result) (*env)->SetLongArrayRegion(env,result,0,4,values); return result;
+    jlongArray result=(*env)->NewLongArray(env,6); if (result) (*env)->SetLongArrayRegion(env,result,0,6,values); return result;
 }
 static Method session_method(Word object,const char *selector,const char *receiver,int class_receiver) {
     if (!receiver) return NULL;

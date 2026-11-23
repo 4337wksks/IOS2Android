@@ -47,7 +47,15 @@ static Method ui_paragraph_method(Word object,const char *selector,const char *r
     return NULL;
 }
 
-struct TextFieldState { Word object,properties[17]; struct TextFieldState *next; };
+struct TextFieldState {
+    Word object,properties[17],attributed,detection;
+    struct GuestInsets insets;
+    struct GuestRange selection;
+    unsigned multiline,editable,selectable,revision,synced_revision,synced,closed,delegate_epoch,delegate_cached;
+    Method callbacks[8];
+    float metrics[21];int options[22];
+    struct TextFieldState *next;
+};
 static struct TextFieldState *text_fields;
 static Word text_first_responder;
 static void text_field_sync(Word);
@@ -130,11 +138,22 @@ static Word ui_attachment_get_image(Word object) { return text_attachment(object
 static const char *const text_field_properties[]={"text","placeholder","textColor","font","borderStyle","clearButtonMode","returnKeyType",
     "contentVerticalAlignment","contentHorizontalAlignment","autocapitalizationType","autocorrectionType","textAlignment","delegate",
     "keyboardType","spellCheckingType","secureTextEntry","enabled"};
+static Word ui_font_system(Word,const char *,double);
+static Word ui_color_black(Word,const char *);
+static Word attributed_string(Word);
+static Word attributed_init(Word,const char *,Word,Word);
+static Word attributed_copy(Word,const char *);
+static void input_selection_changed(Word);
+static Word text_resign(Word);
 static struct TextFieldState *text_field_state(Word object) {
+    struct TextFieldState *existing=view_state(object)->input;if(existing)return existing;
     for (struct TextFieldState *field=text_fields;field;field=field->next) if (field->object==object) return field;
     struct TextFieldState *field=calloc(1,sizeof(*field));
     if (!field) stop("Allocation failed","UITextField attributes");
     field->object=object; field->properties[0]=copy_string(""); field->properties[9]=2; field->properties[16]=1;
+    field->multiline=class_inherits(read_word(object),external_class("_OBJC_CLASS_$_UITextView"));field->revision=1;
+    if(field->multiline){field->editable=field->selectable=1;field->insets=(struct GuestInsets){8,0,8,0};field->properties[11]=4;
+        field->properties[2]=ui_color_black(external_class("_OBJC_CLASS_$_UIColor"),"blackColor");field->properties[3]=ui_font_system(external_class("_OBJC_CLASS_$_UIFont"),"systemFontOfSize:",12);view_state(object)->input=field;}
     field->next=text_fields; text_fields=field; return field;
 }
 static int text_field_property(const char *selector,int setter) {
@@ -149,11 +168,28 @@ static int text_field_property(const char *selector,int setter) {
 }
 static Word text_field_get(Word object,const char *selector) { return text_field_state(object)->properties[text_field_property(selector,0)]; }
 static void text_field_set(Word object,const char *selector,Word value) {
+    struct TextFieldState *field=text_field_state(object);
     int index=text_field_property(selector,1);
     if (index==0 || index==1) value=value ? text_copy(value,"copy") : index==0 ? copy_string("") : 0;
-    text_field_state(object)->properties[index]=value;
-    if (text_first_responder==object) text_field_sync(object);
+    field->properties[index]=value;++field->revision;
+    if(index==0){field->attributed=0;size_t length=string_length(value,"Text input");if(field->selection.location>length)field->selection=(struct GuestRange){length,0};else if(field->selection.length>length-field->selection.location)field->selection.length=length-field->selection.location;}
+    if(index==12){field->delegate_cached=0;if(field->multiline)ui_scroll_input_delegate(object,value);}
+    if(field->multiline)ui_input_sync(object);else if (text_first_responder==object) text_field_sync(object);
 }
+static Word text_editor_init(Word object,const char *selector,struct GuestRect frame,Word container) {
+    if(container)stop("Custom text containers are unavailable",selector);
+    view_init_frame(object,selector,frame);text_field_state(object);ui_input_sync(object);return object;
+}
+static Word text_editor_frame(Word object,const char *selector,struct GuestRect frame){return text_editor_init(object,selector,frame,0);}
+static Word text_editor_plain(Word object,const char *selector){return text_editor_init(object,selector,(struct GuestRect){0},0);}
+static void text_editor_attributed(Word object,const char *selector,Word value){struct TextFieldState *field=text_field_state(object);field->attributed=value ? attributed_copy(value,"copy") : 0;field->properties[0]=value ? text_copy(attributed_string(value),"copy") : copy_string("");field->selection=(struct GuestRange){0};++field->revision;ui_input_sync(object);}
+static Word text_editor_get_attributed(Word object){struct TextFieldState *field=text_field_state(object);return field->attributed ? field->attributed : attributed_init(host_allocate(external_class("_OBJC_CLASS_$_NSAttributedString")),"initWithString:",field->properties[0],0);}
+static struct GuestInsets text_editor_insets(Word object){return text_field_state(object)->insets;}
+static void text_editor_set_insets(Word object,const char *selector,struct GuestInsets insets){if(!isfinite(insets.top)||!isfinite(insets.left)||!isfinite(insets.bottom)||!isfinite(insets.right))stop("Invalid text container insets",selector);text_field_state(object)->insets=insets;ui_input_sync(object);}
+static struct GuestRange text_editor_selection(Word object){return text_field_state(object)->selection;}
+static void text_editor_set_selection(Word object,const char *selector,struct GuestRange range){struct TextFieldState *field=text_field_state(object);size_t length=string_length(field->properties[0],selector);if(range.location>length || range.length>length-range.location)stop("Text selection exceeds content",selector);if(!memcmp(&range,&field->selection,sizeof(range)))return;field->selection=range;ui_input_sync(object);input_selection_changed(object);}
+static Word text_editor_property(Word object,const char *selector){struct TextFieldState *field=text_field_state(object);return !strcmp(selector,"isEditable") || !strcmp(selector,"editable") ? field->editable : !strcmp(selector,"isSelectable") || !strcmp(selector,"selectable") ? field->selectable : field->detection;}
+static void text_editor_set_property(Word object,const char *selector,Word value){struct TextFieldState *field=text_field_state(object);if(!strcmp(selector,"setEditable:")){if(!value && text_first_responder==object && !text_resign(object))return;field->editable=value!=0;}else if(!strcmp(selector,"setSelectable:")){if(!value && !field->editable && text_first_responder==object && !text_resign(object))return;field->selectable=value!=0;}else{if(value!=UINTPTR_MAX && (value&~(Word)7))stop("Unsupported text data detectors",selector);field->detection=value;}++field->revision;ui_input_sync(object);}
 struct UIKitColor { Word isa; double red,green,blue,alpha; };
 static Word ui_color_rgba(Word cls,const char *selector,double red,double green,double blue,double alpha) {
     struct UIKitColor *color=calloc(1,sizeof(*color));
@@ -464,6 +500,17 @@ static Method ui_text_method(Word object,const char *selector,const char *receiv
         if (!class_receiver) for (unsigned i=0;i<COUNT(metrics);++i) if (!strcmp(selector,metrics[i])) return (Method)ui_font_metric;
     }
     const char *base=class_receiver ? receiver : external_base(read_word(object));
+    if(!class_receiver && class_inherits(read_word(object),external_class("_OBJC_CLASS_$_UITextView"))){
+        if(!strcmp(selector,"init"))return (Method)text_editor_plain;if(!strcmp(selector,"initWithFrame:"))return (Method)text_editor_frame;if(!strcmp(selector,"initWithFrame:textContainer:"))return (Method)text_editor_init;
+        const char *common[]={"text","textColor","font","returnKeyType","autocapitalizationType","autocorrectionType","textAlignment","delegate","keyboardType","spellCheckingType"};
+        if(paragraph_property(selector,common,COUNT(common),0)>=0)return (Method)text_field_get;
+        if(paragraph_property(selector,common,COUNT(common),1)>=0)return (Method)text_field_set;
+        if(!strcmp(selector,"attributedText"))return (Method)text_editor_get_attributed;if(!strcmp(selector,"setAttributedText:"))return (Method)text_editor_attributed;
+        if(!strcmp(selector,"textContainerInset"))return (Method)text_editor_insets;if(!strcmp(selector,"setTextContainerInset:"))return (Method)text_editor_set_insets;
+        if(!strcmp(selector,"selectedRange"))return (Method)text_editor_selection;if(!strcmp(selector,"setSelectedRange:"))return (Method)text_editor_set_selection;
+        if(!strcmp(selector,"isEditable") || !strcmp(selector,"editable") || !strcmp(selector,"isSelectable") || !strcmp(selector,"selectable") || !strcmp(selector,"dataDetectorTypes"))return (Method)text_editor_property;
+        if(!strcmp(selector,"setEditable:") || !strcmp(selector,"setSelectable:") || !strcmp(selector,"setDataDetectorTypes:"))return (Method)text_editor_set_property;
+    }
     if (!class_receiver && base && !strcmp(base,"_OBJC_CLASS_$_NSTextAttachment")) {
         if (!strcmp(selector,"initWithData:ofType:")) return (Method)ui_attachment_init;
         if (!strcmp(selector,"setImage:")) return (Method)ui_attachment_image;

@@ -62,14 +62,23 @@ python -B -m porter build --help
 
 应用补丁、资源替换、服务配置和着色器转换规则由外部适配器提供。IPA、工具链、配置、签名密钥、适配器和构建产物均放在仓库外。
 
+在线服务优先复用原应用的通用地址与配置；iOS 专属的账号、支付、推送和第三方平台标识不能直接用于 Android。没有可复用配置时，运行库按未配置处理，返回相应失败或不可用状态；Helpshift 有有效 domain 时可使用网页后端。
+
+只读 Bundle 资源默认通过 Android AssetManager 从已安装 APK 访问。文件接口保持资源内的偏移、长度和 EOF，未压缩资源可直接映射；压缩资源按需解码到内存，要求真实文件路径的接口才提取单个文件。应用启动时清理运行库创建的旧资源缓存。
+
+构建阶段将 SPIR-V 打包为 `assets/i2a/shaders.bin`；首次使用时放入应用私有 `code_cache/vulkan/<PACKAGE_REVISION>/`，后续启动直接映射该缓存。图形与计算管线共用持久化的 `pipelines.bin`，按实际管线状态创建并由驱动复用已缓存代码。独立的 `PACKAGE_REVISION` 每次打包更新，和应用版本号无关；新 APK 启动时清理旧修订目录，GPU 或驱动不兼容时重建管线缓存。缓存写入失败不影响正常资源访问和管线创建。
+
 APK 输出到外部工作区的 `out/<application-id>/<CFBundleVersion>/dev|release/`。不同版本共用构建缓存时需顺序构建；并行构建应使用独立工作区。
 
 ### 兼容范围
 
 - 加密镜像与 chained fixups 尚不支持，动态库和符号加载也有覆盖限制。
-- UIKit、Auto Layout 和 CoreAnimation 仅实现部分功能，尚不支持任意 NIB 页面、完整滚动与表格控件行为。
+- UIKit、Auto Layout 和 CoreAnimation 仅实现部分功能，尚不支持任意 NIB 页面、完整触摸滚动与表格控件行为。
+- WebKit 尚缺同步 JavaScript、多窗口、下载、流式请求、自定义请求头的 POST、导航响应决策和非零数据检测选项。
+- 文本输入尚缺完整 TextKit、自定义文本容器、组合字符删除语义、日历等数据检测和原生状态栏点击滚动。
 - Metal → Vulkan 与 MSL/AIR 转换仅支持已实现的接口和转换路径。
-- 音频格式支持仍有限，实时 AudioQueue 播放尚未实现。StoreKit 不提供实际支付功能；第三方 SDK 和在线服务需要相应的 Android 配置与依赖。
+- 音频格式支持仍有限，实时 AudioQueue 播放尚未实现。
+- 通知的完整日历/位置触发、分类动作与附件，Bonjour 浏览/解析，以及手势失败依赖与完整仲裁尚未实现。
 
 ### 许可与署名
 

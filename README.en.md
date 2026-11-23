@@ -62,14 +62,23 @@ The CLI provides `inspect`, `build`, `check-core`, and `shader`. The `check-core
 
 External adapters supply application patches, resource replacements, service configuration, and shader translation rules. Keep IPAs, toolchains, configuration, signing keys, adapters, and build outputs outside the repository.
 
+Online services reuse portable endpoints and configuration from the original application where available. iOS account, payment, push, and third-party platform identifiers cannot be used directly on Android. Without compatible configuration, the runtime reports failure or unavailability. Helpshift can use its web backend when a valid domain is available.
+
+Read-only bundle resources are accessed through Android AssetManager from the installed APK. File interfaces preserve entry-relative offsets, lengths, and EOF; uncompressed resources can be mapped directly, while compressed entries are decoded into memory on demand. Only interfaces requiring a real filesystem path extract individual files. Startup removes obsolete resource caches created by the runtime.
+
+The build packs SPIR-V into `assets/i2a/shaders.bin`. First use places it in the application's private `code_cache/vulkan/<PACKAGE_REVISION>/` directory; later launches map this cached pack. Graphics and compute pipelines share persistent `pipelines.bin` data, with the driver reusing cached code for matching pipeline states. `PACKAGE_REVISION` changes on each packaging run independently of the application version. Startup removes older revision directories, and incompatible GPU or driver cache data is rebuilt. Cache write failures do not prevent normal resource access or pipeline creation.
+
 APKs are written to `out/<application-id>/<CFBundleVersion>/dev|release/` in the external workspace. Build different input versions sequentially when sharing a cache. Use separate workspaces for parallel builds.
 
 ### Compatibility
 
 - Encrypted binaries and chained fixups are not supported. Dynamic library and symbol loading also have coverage limits.
-- UIKit, Auto Layout, and CoreAnimation are partially implemented. Arbitrary NIB screens and full scrolling and table view behavior are not supported.
+- UIKit, Auto Layout, and CoreAnimation are partially implemented. Arbitrary NIB screens and full touch scrolling and table view behavior are not supported.
+- WebKit still lacks synchronous JavaScript, multiple windows, downloads, streaming requests, POST requests with custom headers, navigation response decisions, and nonzero data detection options.
+- Text input still lacks complete TextKit, custom text containers, composed-character deletion, calendar data detection, and native status-bar scroll-to-top behavior.
 - Metal-to-Vulkan and MSL/AIR translation cover only the interfaces and translation paths currently implemented.
-- Audio format support is limited, and real-time AudioQueue playback is not implemented. StoreKit does not provide payment processing. Third-party SDKs and online services require the corresponding Android configuration and dependencies.
+- Audio format support is limited, and real-time AudioQueue playback is not implemented.
+- Full calendar/location notification triggers, notification actions and attachments, Bonjour browsing/resolution, and gesture failure dependencies and arbitration are not implemented.
 
 ### License and attribution
 

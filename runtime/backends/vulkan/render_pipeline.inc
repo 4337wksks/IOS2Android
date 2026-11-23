@@ -13,7 +13,7 @@ struct MetalPipeline {
     struct MetalResource object;
     struct MetalFunction *vertex,*fragment;
     VkDescriptorSetLayout sets[2];
-    unsigned dynamic_uniform,dynamic_storage,dynamic_count,*dynamic_slots[2];
+    unsigned dynamic_uniform,dynamic_storage,dynamic_count,*dynamic_slots[2],descriptor_counts[6];
     VkPipelineLayout layout;
     VkPipeline compute_fallback;
     VkRenderPass pass;
@@ -31,6 +31,43 @@ struct MetalPipeline {
 struct MetalPipelineReflection { Word isa,vertex,fragment; };
 static VkPipelineCache metal_pipeline_cache;
 static pthread_mutex_t metal_pipeline_cache_mutex=PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t metal_pipeline_save_mutex=PTHREAD_MUTEX_INITIALIZER;
+static uint64_t metal_pipeline_generation,metal_pipeline_saved_generation;
+static unsigned metal_pipeline_save_pending,metal_pipeline_cache_initialized;
+static int metal_pipeline_cache_valid(const void *data,size_t size){
+    if(size<sizeof(VkPipelineCacheHeaderVersionOne))return 0;VkPipelineCacheHeaderVersionOne header;memcpy(&header,data,sizeof(header));
+    return header.headerSize>=sizeof(header) && header.headerSize<=size && header.headerVersion==VK_PIPELINE_CACHE_HEADER_VERSION_ONE && header.vendorID==vulkan.properties.vendorID && header.deviceID==vulkan.properties.deviceID && !memcmp(header.pipelineCacheUUID,vulkan.properties.pipelineCacheUUID,VK_UUID_SIZE);
+}
+static void metal_pipeline_cache_initialize(void){
+    if(metal_pipeline_cache_initialized)return;metal_pipeline_cache_initialized=1;const char *directory=shader_cache_root();void *data=NULL;size_t size=0;char *path=NULL;
+    if(directory && asprintf(&path,"%s/pipelines.bin",directory)>=0){int fd=open(path,O_RDONLY|O_CLOEXEC);if(fd>=0){struct stat info;if(!fstat(fd,&info) && info.st_size>0 && (uint64_t)info.st_size<=SIZE_MAX){size=(size_t)info.st_size;data=mmap(NULL,size,PROT_READ,MAP_PRIVATE,fd,0);if(data==MAP_FAILED)data=NULL;}close(fd);if(!data || !metal_pipeline_cache_valid(data,size)){if(data)munmap(data,size);data=NULL;size=0;unlink(path);}}free(path);}
+    VkPipelineCacheCreateInfo info={.sType=VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,.initialDataSize=data ? size : 0,.pInitialData=data};
+    VkResult result=VKD(vkCreatePipelineCache)(vulkan.device,&info,NULL,&metal_pipeline_cache);
+    if(result!=VK_SUCCESS && data){info.initialDataSize=0;info.pInitialData=NULL;result=VKD(vkCreatePipelineCache)(vulkan.device,&info,NULL,&metal_pipeline_cache);}
+    if(data)munmap(data,size);
+    if(result!=VK_SUCCESS){metal_pipeline_cache=VK_NULL_HANDLE;LOG("Vulkan pipeline disk cache unavailable: result=%d",result);}
+    else LOG("Vulkan pipeline cache initialized: %zu cached bytes",info.initialDataSize);
+}
+static void metal_pipeline_request_save(void){
+    if(!shader_cache_directory || __atomic_exchange_n(&metal_pipeline_save_pending,1,__ATOMIC_ACQ_REL))return;
+    JNIEnv *env=attached_environment("Pipeline cache persistence");static jmethodID method;if(!method){jclass type=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,type,"schedulePipelineCacheSave","()V");(*env)->DeleteLocalRef(env,type);}(*env)->CallVoidMethod(env,activity,method);
+    if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);__atomic_store_n(&metal_pipeline_save_pending,0,__ATOMIC_RELEASE);LOG("Vulkan pipeline cache save scheduling failed");}
+}
+static VkResult metal_cached_compile(unsigned compute,uint32_t count,const void *info,VkPipeline *output){
+    pthread_mutex_lock(&metal_pipeline_cache_mutex);metal_pipeline_cache_initialize();VkResult result=vulkan_compile_pipeline(compute,metal_pipeline_cache,count,info,output);
+    if(result==VK_SUCCESS && metal_pipeline_cache)++metal_pipeline_generation;pthread_mutex_unlock(&metal_pipeline_cache_mutex);
+    if(result==VK_SUCCESS)metal_pipeline_request_save();return result;
+}
+JNIEXPORT void JNICALL HOST_JNI(HostActivity_persistPipelineCache)(JNIEnv *env,jobject instance){
+    pthread_mutex_lock(&metal_pipeline_save_mutex);pthread_mutex_lock(&metal_pipeline_cache_mutex);
+    uint64_t generation=metal_pipeline_generation;size_t size=0;void *data=NULL;VkResult result=VK_SUCCESS;
+    if(shader_cache_directory && metal_pipeline_cache && generation!=metal_pipeline_saved_generation){result=VKD(vkGetPipelineCacheData)(vulkan.device,metal_pipeline_cache,&size,NULL);if(result==VK_SUCCESS && size){data=malloc(size);if(data)result=VKD(vkGetPipelineCacheData)(vulkan.device,metal_pipeline_cache,&size,data);else result=VK_ERROR_OUT_OF_HOST_MEMORY;}}
+    pthread_mutex_unlock(&metal_pipeline_cache_mutex);int saved=0;
+    if(data && result==VK_SUCCESS){char *path=NULL,*temporary=NULL;if(asprintf(&path,"%s/pipelines.bin",shader_cache_directory)>=0 && asprintf(&temporary,"%s/pipelines-XXXXXX.tmp",shader_cache_directory)>=0){int fd=mkstemps(temporary,4);if(fd>=0){size_t done=0;while(done<size){ssize_t written=write(fd,(char *)data+done,size-done);if(written<0 && errno==EINTR)continue;if(written<=0)break;done+=(size_t)written;}int closed=close(fd);if(done==size && !closed && !rename(temporary,path))saved=1;else LOG("Vulkan pipeline cache write failed: %s",strerror(errno));unlink(temporary);}}free(path);free(temporary);}
+    else if(result!=VK_SUCCESS)LOG("Vulkan pipeline cache serialization failed: result=%d",result);
+    free(data);pthread_mutex_lock(&metal_pipeline_cache_mutex);if(saved){metal_pipeline_saved_generation=generation;LOG("Vulkan pipeline cache saved: %zu bytes",size);}int changed=saved && generation!=metal_pipeline_generation;__atomic_store_n(&metal_pipeline_save_pending,0,__ATOMIC_RELEASE);pthread_mutex_unlock(&metal_pipeline_cache_mutex);pthread_mutex_unlock(&metal_pipeline_save_mutex);
+    if(changed)metal_pipeline_request_save();
+}
 static struct { uint64_t bits; VkSampler sampler; } metal_literal_samplers[16];
 static pthread_mutex_t metal_literal_sampler_mutex=PTHREAD_MUTEX_INITIALIZER;
 
@@ -146,6 +183,10 @@ static VkDescriptorType metal_pipeline_binding_type(const struct MetalPipeline *
     if (type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && pipeline->dynamic_storage) return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
     return (VkDescriptorType)type;
 }
+static unsigned metal_descriptor_kind_index(VkDescriptorType type) {
+    return type==VK_DESCRIPTOR_TYPE_SAMPLER ? 0 : type==VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ? 1 : type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? 2 :
+        type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ? 4 : type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC ? 5 : 3;
+}
 static VkResult metal_pipeline_layout(struct MetalPipeline *pipeline) {
     unsigned uniform=0,storage=0;
     for (unsigned stage_index=0;stage_index<2;++stage_index) {
@@ -170,6 +211,7 @@ static VkResult metal_pipeline_layout(struct MetalPipeline *pipeline) {
         for (unsigned i=0;i<count;++i) {
             const struct ShaderBindingSpec *binding=&shader_bindings[function->spec->first_binding+i];
             VkDescriptorType type=metal_pipeline_binding_type(pipeline,binding->type);
+            ++pipeline->descriptor_counts[metal_descriptor_kind_index(type)];
             bindings[i]=(VkDescriptorSetLayoutBinding){.binding=binding->binding,.descriptorType=type,
                 .descriptorCount=1,.stageFlags=function->compute_fallback ? VK_SHADER_STAGE_COMPUTE_BIT : stage_index ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT};
             if (type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
@@ -252,14 +294,7 @@ static VkResult metal_pipeline_variant(struct MetalPipeline *pipeline,const stru
     VkGraphicsPipelineCreateInfo info={.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.stageCount=pipeline->fragment ? 2 : 1,.pStages=stages,
         .pVertexInputState=&vertex,.pInputAssemblyState=&assembly,.pViewportState=&viewport,.pRasterizationState=&raster,.pMultisampleState=&multisample,
         .pDepthStencilState=&depth,.pColorBlendState=&blend,.pDynamicState=&dynamic,.layout=pipeline->layout,.renderPass=pipeline->pass,.subpass=0};
-    pthread_mutex_lock(&metal_pipeline_cache_mutex);
-    VkResult result=VK_SUCCESS;
-    if (!metal_pipeline_cache) {
-        VkPipelineCacheCreateInfo cache={.sType=VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-        result=VKD(vkCreatePipelineCache)(vulkan.device,&cache,NULL,&metal_pipeline_cache);
-    }
-    if (result==VK_SUCCESS) result=vulkan_compile_pipeline(0,metal_pipeline_cache,1,&info,&variant->pipeline);
-    pthread_mutex_unlock(&metal_pipeline_cache_mutex);
+    VkResult result=metal_cached_compile(0,1,&info,&variant->pipeline);
     if (result==VK_SUCCESS) {
          
         metal_object_retain((Word)variant->key.depth);
@@ -350,7 +385,7 @@ static Word metal_pipeline_new(Word device,const char *selector,struct MetalDesc
         }
         VkComputePipelineCreateInfo compute={.sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
             .stage={.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_COMPUTE_BIT,.module=pipeline->vertex->module,.pName="main"},.layout=pipeline->layout};
-        if (result==VK_SUCCESS) result=vulkan_compile_pipeline(1,VK_NULL_HANDLE,1,&compute,&pipeline->compute_fallback);
+        if (result==VK_SUCCESS) result=metal_cached_compile(1,1,&compute,&pipeline->compute_fallback);
     } else if (result==VK_SUCCESS) result=metal_pipeline_pass(pipeline);
     struct MetalPipelineKey key={.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,.front=VK_FRONT_FACE_CLOCKWISE,.polygon=VK_POLYGON_MODE_FILL};
     VkPipeline initial=VK_NULL_HANDLE;

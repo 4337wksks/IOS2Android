@@ -63,12 +63,8 @@ static void motion_delivery_cleanup(void *context) {
     if (d->handler) _Block_release((void *)d->handler);
     free(d);
 }
-static void motion_enqueue(struct MotionDelivery *delivery,Word queue) {
-    Word operation=host_allocate(external_class("_OBJC_CLASS_$_NSInvocationOperation"));
-    invocation_operation(operation,"initWithTarget:selector:object:",(Word)delivery,"performMotionDelivery:",0);
-    struct Operation *state=operation_state(operation); state->cleanup=motion_delivery_cleanup; state->cleanup_context=delivery;
-    queue_add(queue,"addOperation:",operation);
-}
+static void motion_delivery_run(void *delivery) { motion_deliver((Word)delivery,"performMotionDelivery:",0); }
+static void motion_enqueue(struct MotionDelivery *delivery,Word queue) { schedule_queue_function(queue,motion_delivery_run,delivery,motion_delivery_cleanup); }
 static void motion_stream_stop(Word object,const char *selector) {
     pthread_mutex_lock(&motion_stream_mutex); struct MotionStream *s=motion_stream(object);
     s->active=0; s->pending=0; ++s->generation; Word handler=s->handler; s->handler=0;

@@ -13,7 +13,24 @@ struct ShaderSpec {
 struct ShaderLibrarySpec { const char *name; unsigned char sha256[32]; uint32_t size,first_entry,entry_count,source; };
 #include "shaders.h"
 _Static_assert(I2A_SHADER_PACK_VERSION == 1, "Shader pack ABI mismatch");
-extern const unsigned char guest_spirv_data[];
+static const unsigned char *guest_spirv_data;
+static _Atomic(char *) shader_cache_directory;
+static AAsset *shader_pack_asset;
+static pthread_once_t shader_pack_once=PTHREAD_ONCE_INIT;
+static void shader_pack_initialize(void){
+    JNIEnv *env=attached_environment("Shader cache");jclass type=(*env)->GetObjectClass(env,activity);
+    jmethodID method=(*env)->GetMethodID(env,type,"shaderCacheDirectory","(J)Ljava/lang/String;");
+    jstring directory=(*env)->CallObjectMethod(env,activity,method,(jlong)I2A_SHADER_PACK_BYTES);(*env)->DeleteLocalRef(env,type);
+    if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);directory=NULL;}
+    if(directory){const char *path=(*env)->GetStringUTFChars(env,directory,NULL);if(path){shader_cache_directory=strdup(path);(*env)->ReleaseStringUTFChars(env,directory,path);}(*env)->DeleteLocalRef(env,directory);}
+    if(!I2A_SHADER_PACK_BYTES)return;
+    int cached=0;
+    if(shader_cache_directory){char *path=NULL;if(asprintf(&path,"%s/shaders.bin",shader_cache_directory)>=0){int fd=open(path,O_RDONLY|O_CLOEXEC);free(path);if(fd>=0){struct stat info;if(!fstat(fd,&info) && info.st_size==I2A_SHADER_PACK_BYTES){void *mapped=mmap(NULL,I2A_SHADER_PACK_BYTES,PROT_READ,MAP_PRIVATE,fd,0);if(mapped!=MAP_FAILED){guest_spirv_data=mapped;cached=1;}}close(fd);}}}
+    if(!guest_spirv_data){shader_pack_asset=AAssetManager_open(bundle_assets,"i2a/shaders.bin",AASSET_MODE_BUFFER);if(shader_pack_asset && AAsset_getLength64(shader_pack_asset)==I2A_SHADER_PACK_BYTES)guest_spirv_data=AAsset_getBuffer(shader_pack_asset);}
+    if(!guest_spirv_data)stop("Shader pack unavailable","Vulkan resource cache");
+    LOG("Vulkan shader pack loaded from %s (%u bytes)",cached ? "private cache" : "APK",(unsigned)I2A_SHADER_PACK_BYTES);
+}
+static const char *shader_cache_root(void){pthread_once(&shader_pack_once,shader_pack_initialize);return shader_cache_directory;}
 static unsigned char *guest_sha256(const void *,uint32_t,unsigned char *);
 struct MetalLibrary { struct MetalResource object; const struct ShaderLibrarySpec *spec; };
 struct MetalFunction { struct MetalResource object; const struct ShaderSpec *spec; VkShaderModule module; Word attributes,arguments; unsigned compute_fallback; };
@@ -134,6 +151,7 @@ static Word metal_library_function(struct MetalLibrary *library,const char *sele
             LOG("Original vertex storage writes require unsupported Vulkan feature: %s",spec->name); return 0;
         }
     unsigned index=(unsigned)(spec-shader_specs);
+    pthread_once(&shader_pack_once,shader_pack_initialize);
     pthread_mutex_lock(&metal_shader_mutex);
     struct MetalFunction *function=metal_function_cache[index];
     if (!function) {

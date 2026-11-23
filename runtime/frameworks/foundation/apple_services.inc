@@ -159,7 +159,28 @@ static void store_finish_transaction(Word self,const char *selector,Word object)
     delivery->removed=1; delivery->transactions=(void *)new_array(external_class("_OBJC_CLASS_$_NSArray"),selector,&object,1);
     schedule_main_function(store_queue_deliver,delivery);
 }
-struct StoreProductsRequestState { Word object,identifiers,delegate; unsigned generation,running; struct StoreProductsRequestState *next; };
+struct StoreRestoreDelivery { Word queue,error; struct Sequence *observers; };
+static void store_restore_deliver(void *context) {
+    struct StoreRestoreDelivery *delivery=context;
+    const char *selector="paymentQueue:restoreCompletedTransactionsFailedWithError:";
+    for(size_t i=0;i<delivery->observers->count;++i){
+        Word observer=delivery->observers->items[i];
+        pthread_mutex_lock(&store_payment_mutex);int active=sequence_contains((void *)payment_observers,selector,observer);pthread_mutex_unlock(&store_payment_mutex);
+        Method callback=active ? find_implementation(observer,selector) : NULL;
+        if(callback)callback(observer,selector,delivery->queue,delivery->error,0,0);
+        metal_object_release(observer);
+    }
+    free(delivery->observers->items);free(delivery->observers);free(delivery);
+}
+static void store_restore(Word object,const char *selector,Word username) {
+    struct StoreRestoreDelivery *delivery=calloc(1,sizeof(*delivery));if(!delivery)stop("Allocation failed",selector);
+    delivery->queue=store_queue(external_class("_OBJC_CLASS_$_SKPaymentQueue"));
+    delivery->error=unsupported_service_error("SKErrorDomain",4,"Purchase restoration is unavailable on this host");
+    pthread_mutex_lock(&store_payment_mutex);delivery->observers=(void *)sequence_copy((void *)payment_observers,"copy");
+    for(size_t i=0;i<delivery->observers->count;++i)metal_object_retain(delivery->observers->items[i]);pthread_mutex_unlock(&store_payment_mutex);
+    schedule_main_function(store_restore_deliver,delivery);
+}
+struct StoreProductsRequestState { Word object,identifiers,delegate; unsigned generation,running,receipt; struct StoreProductsRequestState *next; };
 struct StoreProductsDelivery { struct StoreProductsRequestState *request; unsigned generation; };
 static struct StoreProductsRequestState *store_product_requests;
 static pthread_mutex_t store_product_mutex=PTHREAD_MUTEX_INITIALIZER;
@@ -175,6 +196,15 @@ static Word store_products_init(Word object,const char *selector,Word identifier
     struct StoreProductsRequestState *state=store_product_state(object);
     state->identifiers=sequence_copy((void *)identifiers,"copy"); state->running=0; ++state->generation;
     pthread_mutex_unlock(&store_product_mutex); return object;
+}
+static Word store_receipt_init(Word object,const char *selector,Word properties) {
+    if(properties && !class_inherits(read_word(properties),external_class("_OBJC_CLASS_$_NSDictionary")))stop("Invalid receipt properties",selector);
+    Word copied=properties ? map_copy((void *)properties,"copy") : 0;
+    pthread_mutex_lock(&store_product_mutex);struct StoreProductsRequestState *state=store_product_state(object);
+    state->identifiers=copied;state->receipt=1;state->running=0;++state->generation;pthread_mutex_unlock(&store_product_mutex);return object;
+}
+static Word store_receipt_properties(Word object) {
+    pthread_mutex_lock(&store_product_mutex);Word properties=store_product_state(object)->identifiers;pthread_mutex_unlock(&store_product_mutex);return properties;
 }
 static void store_products_delegate(Word object,const char *selector,Word delegate) {
     pthread_mutex_lock(&store_product_mutex); store_product_state(object)->delegate=delegate; pthread_mutex_unlock(&store_product_mutex);
@@ -199,6 +229,12 @@ static void store_products_deliver(void *context) {
     if (active) state->running=0;
     pthread_mutex_unlock(&store_product_mutex); free(delivery);
     if (!delegate) return;
+    if(state->receipt){
+        Word error=unsupported_service_error("SKErrorDomain",4,"Receipt refresh is unavailable on this host");
+        Method callback=find_implementation(delegate,"request:didFailWithError:");
+        if(callback)callback(delegate,"request:didFailWithError:",state->object,error,0,0);
+        return;
+    }
     Word response=runtime_extension.unavailable_products_response ? runtime_extension.unavailable_products_response(identifiers) :
         STOREKIT_EMPTY_CATALOGUE ? store_empty_products(identifiers) : 0;
     Method callback;
@@ -219,7 +255,7 @@ static void store_products_deliver(void *context) {
 static void store_products_start(Word object,const char *selector) {
     struct StoreProductsDelivery *delivery=calloc(1,sizeof(*delivery)); if (!delivery) stop("Allocation failed",selector);
     pthread_mutex_lock(&store_product_mutex); struct StoreProductsRequestState *state=store_product_state(object);
-    if (!state->identifiers) { pthread_mutex_unlock(&store_product_mutex); free(delivery); stop("Uninitialized products request",selector); }
+    if (!state->identifiers && !state->receipt) { pthread_mutex_unlock(&store_product_mutex); free(delivery); stop("Uninitialized products request",selector); }
     if (state->running) { pthread_mutex_unlock(&store_product_mutex); free(delivery); return; }
     state->running=1; delivery->request=state; delivery->generation=++state->generation; pthread_mutex_unlock(&store_product_mutex);
     schedule_main_function(store_products_deliver,delivery);
@@ -260,8 +296,12 @@ static Method apple_services_method(Word object,const char *selector,const char 
     if (!class_receiver && class_inherits(cls,external_class("_OBJC_CLASS_$_SKPaymentTransaction")) &&
         (!strcmp(selector,"transactionState") || !strcmp(selector,"payment") || !strcmp(selector,"error") || !strcmp(selector,"transactionIdentifier") ||
          !strcmp(selector,"transactionDate") || !strcmp(selector,"originalTransaction"))) return (Method)store_transaction_property;
-    if (!class_receiver && base && !strcmp(base,"_OBJC_CLASS_$_SKProductsRequest")) {
+    if (!class_receiver && base && (!strcmp(base,"_OBJC_CLASS_$_SKProductsRequest") || !strcmp(base,"_OBJC_CLASS_$_SKReceiptRefreshRequest"))) {
         if (!strcmp(selector,"initWithProductIdentifiers:")) return (Method)store_products_init;
+        if (!strcmp(base,"_OBJC_CLASS_$_SKReceiptRefreshRequest")){
+            if(!strcmp(selector,"initWithReceiptProperties:"))return (Method)store_receipt_init;
+            if(!strcmp(selector,"receiptProperties"))return (Method)store_receipt_properties;
+        }
         if (!strcmp(selector,"setDelegate:")) return (Method)store_products_delegate;
         if (!strcmp(selector,"delegate")) return (Method)store_products_get_delegate;
         if (!strcmp(selector,"start")) return (Method)store_products_start;
@@ -295,6 +335,7 @@ static Method apple_services_method(Word object,const char *selector,const char 
         if (!class_receiver && !strcmp(selector,"transactions")) return (Method)store_transactions;
         if (!class_receiver && !strcmp(selector,"addPayment:")) return (Method)store_add_payment;
         if (!class_receiver && !strcmp(selector,"finishTransaction:")) return (Method)store_finish_transaction;
+        if (!class_receiver && (!strcmp(selector,"restoreCompletedTransactions") || !strcmp(selector,"restoreCompletedTransactionsWithApplicationUsername:"))) return (Method)store_restore;
     }
     return NULL;
 }

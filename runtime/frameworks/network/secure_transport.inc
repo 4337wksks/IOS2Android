@@ -4,7 +4,7 @@ struct I2ATLS {
     void *configuration,*ssl; Word connection;
     int (*read)(Word,void *,size_t *);
     int (*write)(Word,const void *,size_t *);
-    char *hostname; int state,break_auth,auth_notified,io_status;
+    char *hostname; int state,break_auth,auth_notified,io_status,defer_verification;unsigned waiting;
     size_t plaintext_read,plaintext_written;
     FILE *request_capture,*response_capture;
     struct Trust *trust;
@@ -28,6 +28,7 @@ struct I2ATLS {
     X(int,SSL_read_ex,(void *,void *,size_t,size_t *)) \
     X(int,SSL_write_ex,(void *,const void *,size_t,size_t *)) \
     X(int,SSL_shutdown,(void *)) \
+    X(int,SSL_pending,(const void *)) \
     X(const char *,SSL_get_version,(const void *)) \
     X(void *,BIO_meth_new,(int,const char *)) \
     X(int,BIO_meth_set_read,(void *,int (*)(void *,char *,int))) \
@@ -207,6 +208,7 @@ static int i2a_tls_verify(void *store,void *argument) {
     struct I2ATLS *context=argument;
     if (!context->trust) context->trust=i2a_tls_peer_trust(store);
     if (!context->trust || !context->hostname) { i2a_tls_api.X509_STORE_CTX_set_error(store,50); return 0; }
+    if(context->defer_verification){i2a_tls_api.X509_STORE_CTX_set_error(store,0);return 1;}
     if (context->break_auth && !i2a_tls_custom_ca_bypass(context) && !context->auth_notified) {
         context->auth_notified=1;
         i2a_tls_api.X509_STORE_CTX_set_error(store,0);
@@ -225,6 +227,7 @@ static int i2a_tls_verify(void *store,void *argument) {
 }
 static int i2a_tls_status(struct I2ATLS *context,int result,const char *operation) {
     int error=i2a_tls_api.SSL_get_error(context->ssl,result);
+    context->waiting=error==2 ? ALOOPER_EVENT_INPUT : error==3 ? ALOOPER_EVENT_OUTPUT : 0;
     if (error==2 || error==3) return -9803;
     if (error==12) return -9841;  
     if (error==6) { context->state=3; return -9805; }

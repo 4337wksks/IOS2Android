@@ -80,16 +80,34 @@ __attribute__((naked)) static void darwin_sscanf(void) { __asm__ volatile("mov x
 __attribute__((naked)) static void darwin_fscanf(void) { __asm__ volatile("mov x2,sp\n b guest_fscanf"); }
 __attribute__((naked)) static void darwin_scanf(void) { __asm__ volatile("mov x1,sp\n b guest_scanf"); }
 
+struct BundleStream { FILE *stream; int fd; struct BundleStream *next; };
+static struct BundleStream *bundle_streams;
+static pthread_mutex_t bundle_streams_mutex=PTHREAD_MUTEX_INITIALIZER;
+static int bundle_stream_read(void *context,char *bytes,int length){return (int)io_read(((struct BundleStream *)context)->fd,bytes,(size_t)length);}
+static fpos_t bundle_stream_seek(void *context,fpos_t offset,int origin){return io_seek(((struct BundleStream *)context)->fd,offset,origin);}
+static int bundle_stream_close(void *context){
+    struct BundleStream *entry=context;pthread_mutex_lock(&bundle_streams_mutex);struct BundleStream **slot=&bundle_streams;
+    while(*slot && *slot!=entry)slot=&(*slot)->next;if(*slot)*slot=entry->next;pthread_mutex_unlock(&bundle_streams_mutex);
+    int result=io_close(entry->fd);free(entry);return result;
+}
+static FILE *guest_fdopen(int fd,const char *mode){
+    struct BundleFile *file=bundle_fd_acquire(fd);if(!file)return fdopen(fd,mode);bundle_file_release(file);
+    if(!mode || *mode!='r' || strchr(mode,'+')){errno=EACCES;return NULL;}
+    struct BundleStream *entry=calloc(1,sizeof(*entry));if(!entry){errno=ENOMEM;return NULL;}entry->fd=fd;
+    entry->stream=funopen(entry,bundle_stream_read,NULL,bundle_stream_seek,bundle_stream_close);
+    if(!entry->stream){free(entry);return NULL;}pthread_mutex_lock(&bundle_streams_mutex);entry->next=bundle_streams;bundle_streams=entry;pthread_mutex_unlock(&bundle_streams_mutex);return entry->stream;
+}
+static int guest_fileno(FILE *stream){pthread_mutex_lock(&bundle_streams_mutex);struct BundleStream *entry=bundle_streams;while(entry && entry->stream!=stream)entry=entry->next;int fd=entry ? entry->fd : -1;pthread_mutex_unlock(&bundle_streams_mutex);return fd>=0 ? fd : fileno(stream);}
 static FILE *guest_fopen(const char *path,const char *mode) {
     if (!path || !mode || !*mode) { errno=EINVAL; return NULL; }
     int writing=*mode!='r' || strchr(mode,'+')!=NULL;
     if (writing && !writable_sandbox_path(path)) return NULL;
-    char *native=native_path(path);
-    if (!native) return NULL;
-    FILE *stream=fopen(native,mode);
+    FILE *stream;
+    if(bundle_relative(path)){int fd=io_open(path,O_RDONLY|O_CLOEXEC,0);if(fd<0)return NULL;stream=guest_fdopen(fd,mode);if(!stream){int code=errno;io_close(fd);errno=code;}}
+    else stream=fopen(path,mode);
     static unsigned logged;
     if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<16) LOG("fopen %s mode=%s result=%p",path,mode,stream);
-    free(native); return stream;
+    return stream;
 }
 static FILE *guest_freopen(const char *path,const char *mode,FILE *stream) {
     if (!mode || !*mode) { errno=EINVAL; return NULL; }
@@ -109,8 +127,8 @@ static Word resolve_stdio_import(const char *name) {
     if (!strcmp(name,"___stderrp")) { guest_standard_streams[2]=stderr; return (Word)&guest_standard_streams[2]; }
     if (!strcmp(name,"_fopen")) return (Word)guest_fopen;
     if (!strcmp(name,"_freopen")) return (Word)guest_freopen;
-    if (!strcmp(name,"_fdopen")) return (Word)fdopen;
-    if (!strcmp(name,"_fileno")) return (Word)fileno;
+    if (!strcmp(name,"_fdopen")) return (Word)guest_fdopen;
+    if (!strcmp(name,"_fileno")) return (Word)guest_fileno;
     if (!strcmp(name,"_fputs")) return (Word)fputs;
     if (!strcmp(name,"_fputc")) return (Word)fputc;
     if (!strcmp(name,"_putc")) return (Word)putc;

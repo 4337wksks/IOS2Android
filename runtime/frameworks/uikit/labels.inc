@@ -1,13 +1,14 @@
 /* UIKit keeps ownership of content and positions. Android lays out the same
  * attributed runs and native attachment bounds for both sizeToFit and drawing. */
-struct LabelState { Word object,text,attributed,font,color,shadow,synced_text; jobject rich_text; long alignment,lines,line_break; int adjusts,synced; float metrics[12]; jint options[9]; struct LabelState *next;
+struct LabelState { Word object,text,attributed,font,color,shadow,synced_text; jobject rich_text; long alignment,lines,line_break; double preferred_width;int adjusts,synced; float metrics[12]; jint options[9]; struct LabelState *next;
 #if I2A_DEVELOPMENT
     unsigned diagnostic_traces;
 #endif
 };
 struct ControlAppearance { Word state,title,image,color; struct ControlAppearance *next; };
 struct ControlAction { Word target,events; const char *selector; struct ControlAction *next; };
-struct ControlState { Word object,label,image,empty_title,default_color,synced_image,synced_accessibility,indicator_color; unsigned button,type,enabled,selected,highlighted,synced,indicator,animating,hides; struct GuestRect content_insets,title_insets; struct ControlAppearance *appearances; struct ControlAction *actions; float metrics[10]; jint options[11]; };
+struct ControlState { Word object,label,image,image_view,empty_title,default_color,synced_image,synced_accessibility,indicator_color; unsigned button,type,enabled,selected,highlighted,synced,indicator,animating,hides; struct GuestRect content_insets,title_insets,image_insets; struct ControlAppearance *appearances; struct ControlAction *actions; float metrics[10]; jint options[11]; };
+static Word image_view_init(Word,const char *,Word);
 static void ui_control_sync(Word);
 static struct LabelState *label_states;
 
@@ -20,7 +21,7 @@ static struct LabelState *label_state(Word object) {
 }
 static int label_object(Word object) { const char *base=object ? external_base(read_word(object)) : NULL; return base && !strcmp(base,"_OBJC_CLASS_$_UILabel"); }
 static void label_collect_order(Word object,struct Sequence *order) {
-    if (label_object(object) || view_state(object)->control) sequence_add(order,"UIView drawing order",object);
+    if (label_object(object) || view_state(object)->control || view_state(object)->web || view_state(object)->input) sequence_add(order,"UIView drawing order",object);
     struct Sequence *children=(void *)view_state(object)->children;
     for (size_t i=0;i<children->count;++i) label_collect_order(children->items[i],order);
 }
@@ -107,6 +108,27 @@ static jobject label_rich_text(JNIEnv *env,jclass cls,struct LabelState *state) 
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); stop("Android attributed text failed","UILabel"); }
     state->rich_text=(*env)->NewGlobalRef(env,result); (*env)->DeleteLocalRef(env,result); return state->rich_text;
 }
+static struct LabelState *text_editor_label(struct TextFieldState *field) {
+    struct LabelState *label=label_state(field->object);
+    if(label->text!=field->properties[0] || label->font!=field->properties[3] || label->color!=field->properties[2] || label->attributed!=field->attributed || label->alignment!=(long)field->properties[11]){
+        label->text=field->properties[0];label->font=field->properties[3];label->color=field->properties[2];label->attributed=field->attributed;label->alignment=field->properties[11];label->lines=0;label->line_break=0;label_content_changed(label);
+    }
+    return label;
+}
+static void ui_input_sync(Word object) {
+    struct ViewState *view=view_state(object);struct TextFieldState *field=view->input;if(!field || field->closed)return;
+    float metrics[21]={0};int options[22]={0};view_host_geometry(object,metrics,options);double scale=screen_scale();struct UIKitFont *font=(void *)field->properties[3];
+    metrics[11]=(font ? font->size : 12)*scale;metrics[12]=(field->insets.left+5)*scale;metrics[13]=field->insets.top*scale;metrics[14]=(field->insets.right+5)*scale;metrics[15]=field->insets.bottom*scale;metrics[18]=scale;
+    options[3]=field->editable;options[4]=field->selectable;options[5]=field->properties[10];options[6]=field->properties[14];options[7]=field->properties[13];options[8]=field->properties[6];options[9]=field->properties[9];options[10]=field->properties[15];options[11]=(int)(field->detection&7);options[12]=field->properties[11];options[13]=label_argb(field->properties[2],0xff000000);options[14]=label_argb(view->background,0xffffffff);options[15]=field->selection.location;options[16]=field->selection.location+field->selection.length;
+    ui_scroll_input_options(object,metrics,options);
+    if(field->synced && field->synced_revision==field->revision && !memcmp(field->metrics,metrics,sizeof(metrics)) && !memcmp(field->options,options,sizeof(options)))return;
+    JNIEnv *env=attached_environment("Text input sync");static jmethodID method;if(!method){jclass type=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,type,"syncGuestEditor","(JLjava/lang/CharSequence;[F[I)V");(*env)->DeleteLocalRef(env,type);}
+    jclass cls=(*env)->GetObjectClass(env,activity);jobject text=field->synced_revision!=field->revision ? label_rich_text(env,cls,text_editor_label(field)) : NULL;(*env)->DeleteLocalRef(env,cls);
+    jfloatArray m=(*env)->NewFloatArray(env,COUNT(metrics));jintArray o=(*env)->NewIntArray(env,COUNT(options));(*env)->SetFloatArrayRegion(env,m,0,COUNT(metrics),metrics);(*env)->SetIntArrayRegion(env,o,0,COUNT(options),options);
+    (*env)->CallVoidMethod(env,activity,method,(jlong)object,text,m,o);(*env)->DeleteLocalRef(env,m);(*env)->DeleteLocalRef(env,o);
+    if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);stop("Android text input failed","UITextView");}
+    field->synced=1;field->synced_revision=field->revision;memcpy(field->metrics,metrics,sizeof(metrics));memcpy(field->options,options,sizeof(options));
+}
 static void ui_label_sync(Word object) {
     if (!label_object(object)) {
         struct ViewState *state=view_state(object);
@@ -174,6 +196,8 @@ static void label_adjusts(Word object,const char *selector,Word value) { label_s
 static Word label_get_adjusts(Word object) { return label_state(object)->adjusts; }
 static void label_line_break(Word object,const char *selector,Word value) { struct LabelState *state=label_state(object); if (value>5 || value==1 || (state->lines!=1 && (value==3 || value==5))) stop("Unsupported label wrapping mode",selector); state->line_break=value; view_request_layout(object,selector); ui_label_sync(object); }
 static Word label_get_line_break(Word object) { return label_state(object)->line_break; }
+static void label_set_preferred_width(Word object,const char *selector,double width) { if(!isfinite(width) || width<0)stop("Invalid preferred label width",selector);struct LabelState *state=label_state(object);if(state->preferred_width==width)return;state->preferred_width=width;view_request_layout(object,selector); }
+static double label_preferred_width(Word object) { return label_state(object)->preferred_width; }
 #if I2A_DEVELOPMENT
 JNIEXPORT void JNICALL HOST_JNI(HostActivity_dumpLabelDiagnostics)(JNIEnv *env,jobject activity) {
     unsigned count=0,total=0,attached=0;
@@ -204,7 +228,8 @@ static struct GuestSize label_measure(struct LabelState *s,const char *selector,
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); stop("Android label measurement failed",selector); }
     return (struct GuestSize){values[0]/scale,values[1]/scale};
 }
-static struct GuestSize label_size(Word object,const char *selector,struct GuestSize constraint) { return label_measure(label_state(object),selector,constraint); }
+static struct GuestSize label_size(Word object,const char *selector,struct GuestSize constraint) { struct LabelState *state=label_state(object);if(!strcmp(selector,"intrinsicContentSize") && state->lines!=1 && state->preferred_width>0)constraint.width=fmin(constraint.width,state->preferred_width);return label_measure(state,selector,constraint); }
+static struct GuestSize text_editor_size(Word object,const char *selector,struct GuestSize constraint){struct TextFieldState *field=text_field_state(object);struct GuestInsets insets=field->insets;double padding=insets.left+insets.right+10;struct GuestSize size=label_measure(text_editor_label(field),selector,(struct GuestSize){fmax(0,constraint.width-padding),INFINITY});return (struct GuestSize){size.width+padding,size.height+insets.top+insets.bottom};}
 static struct GuestSize ui_string_size(Word object,const char *selector,Word font) {
     if (!font) return (struct GuestSize){0};
     struct LabelState state={.text=object,.font=font,.alignment=4,.lines=1};
@@ -243,6 +268,11 @@ static Word control_title_label(Word object,const char *selector) {
     }
     return state->label;
 }
+static Word control_image_view(Word object,const char *selector) {
+    struct ControlState *state=control_state(object);
+    if(!state->image_view){state->image_view=host_allocate(external_class("_OBJC_CLASS_$_UIImageView"));image_view_init(state->image_view,selector,control_content(state,control_flags(state),1));view_state(state->image_view)->content_mode=1;view_add(object,selector,state->image_view);}
+    ui_control_sync(object);return state->image_view;
+}
 static void ui_control_sync(Word object) {
     struct ViewState *view=view_state(object); struct ControlState *state=view->control;
     if (!state && view->background && class_inherits(read_word(object),external_class("_OBJC_CLASS_$_UIView"))) state=control_state(object);
@@ -253,6 +283,8 @@ static void ui_control_sync(Word object) {
         visible&=!ancestor->hidden; enabled&=ancestor->interaction; alpha*=ancestor->alpha;
     }
     Word flags=control_flags(state),image=state->button ? control_content(state,flags,1) : state->image;
+    if(state->button && state->image_view){struct GuestRect c=state->content_insets,i=state->image_insets;struct ViewState *child=view_state(state->image_view);control_state(state->image_view)->image=image;
+        child->frame=(struct GuestRect){c.y+i.y,c.x+i.x,fmax(0,view->bounds.width-c.y-c.height-i.y-i.height),fmax(0,view->bounds.height-c.x-c.width-i.x-i.width)};child->bounds=(struct GuestRect){0,0,child->frame.width,child->frame.height};ui_control_sync(state->image_view);image=0;}
     int attached=view_window(object)!=0;
     struct ImageSize natural=image ? ui_image_size(image) : (struct ImageSize){0};
     float metrics[]={(float)(x*scale),(float)(y*scale),(float)(view->frame.width*scale),(float)(view->frame.height*scale),(float)alpha,
@@ -324,10 +356,10 @@ static void control_set_property(Word object,const char *selector,Word value) {
 }
 static void control_set_insets(Word object,const char *selector,struct GuestRect insets) {
     struct ControlState *state=control_state(object);
-    if (!strcmp(selector,"setContentEdgeInsets:")) state->content_insets=insets; else state->title_insets=insets;
+    if (!strcmp(selector,"setContentEdgeInsets:")) state->content_insets=insets;else if(!strcmp(selector,"setImageEdgeInsets:"))state->image_insets=insets;else state->title_insets=insets;
     ui_control_sync(object);
 }
-static struct GuestRect control_get_insets(Word object,const char *selector) { struct ControlState *state=control_state(object); return !strcmp(selector,"contentEdgeInsets") ? state->content_insets : state->title_insets; }
+static struct GuestRect control_get_insets(Word object,const char *selector) { struct ControlState *state=control_state(object); return !strcmp(selector,"contentEdgeInsets") ? state->content_insets : !strcmp(selector,"imageEdgeInsets") ? state->image_insets : state->title_insets; }
 static void control_add_target(Word object,const char *selector,Word target,const char *action,Word events) {
     if (!action || !events) return;
     struct ControlState *state=control_state(object);
@@ -363,6 +395,11 @@ static void control_send_events(Word object,const char *selector,Word events) {
     for (size_t i=0;i<count;++i) control_send_action(object,selector,snapshot[i].selector,snapshot[i].target,0);
     free(snapshot);
 }
+static void input_content_changed(Word object){struct TextFieldState *field=text_field_state(object);if(field->multiline){input_delegate_notify(object,5);platform_notification("UITextViewTextDidChangeNotification",object,0);}else{control_send_events(object,"sendActionsForControlEvents:",1U<<17);platform_notification("UITextFieldTextDidChangeNotification",object,0);}}
+static void input_release_content(Word object){for(struct LabelState *label=label_states;label;label=label->next)if(label->object==object && label->rich_text){JNIEnv *env=attached_environment("Text input release");(*env)->DeleteGlobalRef(env,label->rich_text);label->rich_text=NULL;return;}}
+static Word control_all_targets(Word object,const char *selector) { struct Sequence *targets=(void *)sequence_empty(external_class("_OBJC_CLASS_$_NSMutableSet"));for(struct ControlAction *action=control_state(object)->actions;action;action=action->next)if(action->target)sequence_add(targets,selector,action->target);targets->isa=external_class("_OBJC_CLASS_$_NSSet");return (Word)targets; }
+static Word control_all_events(Word object) { Word events=0;for(struct ControlAction *action=control_state(object)->actions;action;action=action->next)events|=action->events;return events; }
+static Word control_actions_for_target(Word object,const char *selector,Word target,Word event) { struct Sequence *actions=(void *)sequence_empty(external_class("_OBJC_CLASS_$_NSArray"));for(struct ControlAction *action=control_state(object)->actions;action;action=action->next)if(action->target==target && (action->events&event))sequence_add(actions,selector,copy_string(action->selector));if(actions->count)return (Word)actions;free(actions);return 0; }
 JNIEXPORT jstring JNICALL HOST_JNI(HostActivity_completeControlEvent)(JNIEnv *env,jobject instance,jlong token,jint event,jboolean highlighted) {
     may_unwind=1; snprintf(stage,sizeof(stage),"UIKit control action"); int failed=setjmp(boundary);
     if (!failed) { control_set_property(token,"setHighlighted:",highlighted); if (control_state(token)->enabled) control_send_events(token,"sendActionsForControlEvents:",event); }
@@ -411,7 +448,7 @@ static void ui_view_request_display(Word object,const char *selector) {
 }
 static struct GuestSize image_view_size(Word object,const char *selector,struct GuestSize limit) { Word image=control_state(object)->image; struct ImageSize size=image ? ui_image_size(image) : (struct ImageSize){0}; return (struct GuestSize){size.width,size.height}; }
 static void image_view_fit(Word object,const char *selector) { struct ViewState *view=view_state(object); struct GuestSize size=image_view_size(object,selector,(struct GuestSize){0}); struct GuestRect frame=view->frame; frame.width=size.width; frame.height=size.height; view_set_frame(object,selector,frame); }
-static int ui_view_rendered(Word object) { return label_object(object) || view_state(object)->control!=NULL; }
+static int ui_view_rendered(Word object) { return label_object(object) || view_state(object)->control!=NULL || view_state(object)->web!=NULL || view_state(object)->input!=NULL; }
 static void ui_view_load_content(Word object,const char *image,const double *background) {
     if (background) view_state(object)->background=ui_color_rgba(external_class("_OBJC_CLASS_$_UIColor"),"colorWithRed:green:blue:alpha:",background[0],background[1],background[2],background[3]);
     if (image && *image) {
@@ -455,6 +492,7 @@ static struct GuestSize ui_view_intrinsic_size(Word object) {
 }
 static Method ui_labels_method(Word object,const char *selector,const char *receiver,int class_receiver) {
     if (!receiver) return NULL;
+    if(!class_receiver && class_inherits(read_word(object),external_class("_OBJC_CLASS_$_UITextView")) && !strcmp(selector,"sizeThatFits:"))return (Method)text_editor_size;
     if (!class_receiver && !strcmp(selector,"intrinsicContentSize") && (label_object(object) || view_state(object)->control)) return (Method)ui_view_intrinsic_size;
     Word cls=class_receiver ? object : read_word(object);
     if (!class_receiver && class_inherits(cls,external_class("_OBJC_CLASS_$_UIActivityIndicatorView"))) {
@@ -465,16 +503,25 @@ static Method ui_labels_method(Word object,const char *selector,const char *rece
         if (!strcmp(selector,"sizeThatFits:")) return (Method)indicator_size;
     }
     int button=class_inherits(cls,external_class("_OBJC_CLASS_$_UIButton"));
+    if(!class_receiver && class_inherits(cls,external_class("_OBJC_CLASS_$_UIControl"))){
+        if(!strcmp(selector,"allTargets"))return (Method)control_all_targets;if(!strcmp(selector,"allControlEvents"))return (Method)control_all_events;
+        if(!strcmp(selector,"actionsForTarget:forControlEvent:"))return (Method)control_actions_for_target;
+        if(!strcmp(selector,"addTarget:action:forControlEvents:"))return (Method)control_add_target;if(!strcmp(selector,"removeTarget:action:forControlEvents:"))return (Method)control_remove_target;
+        if(!strcmp(selector,"sendActionsForControlEvents:"))return (Method)control_send_events;if(!strcmp(selector,"sendAction:to:forEvent:"))return (Method)control_send_action;
+        if(!strcmp(selector,"state") || !strcmp(selector,"isEnabled") || !strcmp(selector,"isSelected") || !strcmp(selector,"isHighlighted"))return (Method)control_get_property;
+        if(!strcmp(selector,"setEnabled:") || !strcmp(selector,"setSelected:") || !strcmp(selector,"setHighlighted:"))return (Method)control_set_property;
+    }
     if (button) {
         if (class_receiver && !strcmp(selector,"buttonWithType:")) return (Method)control_factory;
         if (!class_receiver) {
             if (!strcmp(selector,"titleLabel")) return (Method)control_title_label;
+            if (!strcmp(selector,"imageView")) return (Method)control_image_view;
             if (!strcmp(selector,"setTitle:forState:") || !strcmp(selector,"setImage:forState:") || !strcmp(selector,"setTitleColor:forState:")) return (Method)control_set_content;
             if (!strcmp(selector,"titleForState:") || !strcmp(selector,"imageForState:") || !strcmp(selector,"titleColorForState:") || !strcmp(selector,"currentTitle") || !strcmp(selector,"currentImage") || !strcmp(selector,"currentTitleColor")) return (Method)control_get_content;
             if (!strcmp(selector,"buttonType") || !strcmp(selector,"state") || !strcmp(selector,"isEnabled") || !strcmp(selector,"isSelected") || !strcmp(selector,"isHighlighted")) return (Method)control_get_property;
             if (!strcmp(selector,"setEnabled:") || !strcmp(selector,"setSelected:") || !strcmp(selector,"setHighlighted:")) return (Method)control_set_property;
-            if (!strcmp(selector,"setContentEdgeInsets:") || !strcmp(selector,"setTitleEdgeInsets:")) return (Method)control_set_insets;
-            if (!strcmp(selector,"contentEdgeInsets") || !strcmp(selector,"titleEdgeInsets")) return (Method)control_get_insets;
+            if (!strcmp(selector,"setContentEdgeInsets:") || !strcmp(selector,"setTitleEdgeInsets:") || !strcmp(selector,"setImageEdgeInsets:")) return (Method)control_set_insets;
+            if (!strcmp(selector,"contentEdgeInsets") || !strcmp(selector,"titleEdgeInsets") || !strcmp(selector,"imageEdgeInsets")) return (Method)control_get_insets;
             if (!strcmp(selector,"addTarget:action:forControlEvents:")) return (Method)control_add_target;
             if (!strcmp(selector,"removeTarget:action:forControlEvents:")) return (Method)control_remove_target;
             if (!strcmp(selector,"sendActionsForControlEvents:")) return (Method)control_send_events;
@@ -489,6 +536,7 @@ static Method ui_labels_method(Word object,const char *selector,const char *rece
         if (!strcmp(selector,"sizeThatFits:")) return (Method)image_view_size;
     }
     if (class_receiver || !label_object(object)) return NULL;
+    if(!strcmp(selector,"setPreferredMaxLayoutWidth:"))return (Method)label_set_preferred_width;if(!strcmp(selector,"preferredMaxLayoutWidth"))return (Method)label_preferred_width;
     if (!strcmp(selector,"setText:")) return (Method)label_text; if (!strcmp(selector,"text")) return (Method)label_get_text;
     if (!strcmp(selector,"setAttributedText:")) return (Method)label_attributed; if (!strcmp(selector,"attributedText")) return (Method)label_get_attributed;
     if (!strcmp(selector,"setFont:")) return (Method)label_font; if (!strcmp(selector,"font")) return (Method)label_get_font;

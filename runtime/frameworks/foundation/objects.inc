@@ -135,6 +135,23 @@ static Word date_relative(Word object,const char *selector,double interval,Word 
 static Word date_relative_now(Word object,const char *selector,double interval) { return date_relative(object,selector,interval,0); }
 static double date_difference(Word object,const char *selector,Word other) { return date_seconds(object)-(other ? date_seconds(other) : scheduling_now()); }
 static double date_difference_now(Word object,const char *selector) { return date_difference(object,selector,0); }
+static Word process_activity_tag;
+static int process_activity_command(Word token,Word options,int begin) {
+    JNIEnv *env=attached_environment("Process activity");static jmethodID command;jmethodID method=__atomic_load_n(&command,__ATOMIC_ACQUIRE);
+    if(!method){jclass cls=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,cls,"processActivity","(JJZ)Z");(*env)->DeleteLocalRef(env,cls);__atomic_store_n(&command,method,__ATOMIC_RELEASE);}
+    int result=(*env)->CallBooleanMethod(env,activity,method,(jlong)token,(jlong)options,(jboolean)begin);
+    if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);return 0;}return result;
+}
+static Word process_begin_activity(Word object,const char *selector,Word options,Word reason) {
+    if(!reason)stop("Missing process activity reason",selector);string_bytes(reason,selector);
+    struct HostObject *token=(void *)host_allocate(external_class("_OBJC_CLASS_$_NSObject"));token->content[0]=options;token->content[3]=(Word)&process_activity_tag;
+    if(!process_activity_command((Word)token,options,1)){free(token);return 0;}return (Word)token;
+}
+static void process_end_activity(Word object,const char *selector,struct HostObject *token) {
+    if(!token || token->isa!=external_class("_OBJC_CLASS_$_NSObject") || token->content[3]!=(Word)&process_activity_tag)stop("Invalid process activity token",selector);
+    if(__atomic_exchange_n(&token->content[1],1,__ATOMIC_ACQ_REL))return;
+    if(!process_activity_command((Word)token,token->content[0],0))stop("Process activity release failed",selector);
+}
 static Word number_init_integer(Word object,const char *selector,Word value) { Word result=number_integer(value); free((void *)object); return result; }
 static Word number_unsigned_byte(struct HostObject *object) { return numeric_integer(object)&255; }
 static void array_subscript_set(struct Sequence *array,const char *selector,Word value,Word index) {
@@ -220,6 +237,10 @@ static Word collection_url(Word cls,const char *selector,Word url) { return url 
 static Word collection_init_url(Word object,const char *selector,Word url) { Word result=collection_url(read_word(object),selector,url); free((void *)object); return result; }
 static Word method_for_selector(Word object,const char *selector,const char *action) { return (Word)find_implementation(object,action); }
 static Method foundation_value_method(Word object,const char *selector,const char *receiver,int class_receiver) {
+    if(receiver && !class_receiver && !strcmp(receiver,"_OBJC_CLASS_$_NSProcessInfo")){
+        if(!strcmp(selector,"beginActivityWithOptions:reason:"))return (Method)process_begin_activity;
+        if(!strcmp(selector,"endActivity:"))return (Method)process_end_activity;
+    }
     if (!strcmp(selector,"isEqual:") || !strcmp(selector,"isEqualToDictionary:") || !strcmp(selector,"isEqualToArray:")) return (Method)equal_objects;
     if (!strcmp(selector,"methodForSelector:")) return (Method)method_for_selector;
     if (!receiver) return NULL;
@@ -355,9 +376,8 @@ static Word file_handle_standard(Word cls,const char *selector) {
     return file_handle_init((void *)host_allocate(cls),selector,descriptor,0);
 }
 static Word file_handle_path(Word cls,const char *selector,Word filename) {
-    char *path=native_path(string_bytes(filename,selector)); if (!path) return 0;
     int mode=strstr(selector,"Updating") ? O_RDWR : strstr(selector,"Writing") ? O_WRONLY : O_RDONLY;
-    int descriptor=open(path,mode|O_CLOEXEC); free(path);
+    int descriptor=io_open(string_bytes(filename,selector),mode|O_CLOEXEC,0);
     if (descriptor<0) return 0;
     return file_handle_init((void *)host_allocate(cls),selector,descriptor,1);
 }
@@ -375,22 +395,21 @@ static void file_handle_write(struct HostObject *self,const char *selector,struc
     }
 }
 static void file_handle_close(struct HostObject *self) {
-    Word value=__atomic_exchange_n(&self->content[0],0,__ATOMIC_ACQ_REL); if (value) close((int)(value-1));
+    Word value=__atomic_exchange_n(&self->content[0],0,__ATOMIC_ACQ_REL); if (value) io_close((int)(value-1));
 }
 static Word file_handle_seek(struct HostObject *self,const char *selector,uint64_t offset) {
     int end=!strcmp(selector,"seekToEndOfFile"),current=!strcmp(selector,"offsetInFile");
     if (!end && !current && offset>INT64_MAX) stop("Invalid file offset",selector);
-    off_t result=lseek(file_handle_descriptor(self,selector),end || current ? 0 : (off_t)offset,end ? SEEK_END : current ? SEEK_CUR : SEEK_SET);
+    off_t result=io_seek(file_handle_descriptor(self,selector),end || current ? 0 : (off_t)offset,end ? SEEK_END : current ? SEEK_CUR : SEEK_SET);
     if (result<0) stop("File handle seek failed",strerror(errno)); return (Word)result;
 }
 static void file_handle_sync(struct HostObject *self,const char *selector) { if (fsync(file_handle_descriptor(self,selector))) stop("File handle sync failed",strerror(errno)); }
 static Word file_handle_url(Word cls,const char *selector,Word url,Word *error) {
     if (error) *error=0;
     if (!url || !url_is_file((void *)url)) return file_failure(error,"File handle URL",EINVAL);
-    const char *path_text=string_bytes(url_path((void *)url),selector); char *path=native_path(path_text);
-    if (!path) return file_failure(error,path_text,errno ? errno : ENOENT);
+    const char *path_text=string_bytes(url_path((void *)url),selector);
     int mode=strstr(selector,"Updating") ? O_RDWR : strstr(selector,"Writing") ? O_WRONLY : O_RDONLY;
-    int descriptor=open(path,mode|O_CLOEXEC),code=errno; free(path);
+    int descriptor=io_open(path_text,mode|O_CLOEXEC,0),code=errno;
     return descriptor<0 ? file_failure(error,path_text,code) : file_handle_init((void *)host_allocate(cls),selector,descriptor,1);
 }
 static Word file_handle_read(struct HostObject *self,const char *selector,Word amount) {
@@ -406,7 +425,7 @@ static Word file_handle_read(struct HostObject *self,const char *selector,Word a
             size_t next=capacity*2; void *grown=realloc(bytes,next); if (!grown) { free(bytes); stop("Allocation failed",selector); } bytes=grown; capacity=next;
         }
         size_t wanted=capacity-used; if (wanted>SSIZE_MAX) wanted=SSIZE_MAX;
-        ssize_t count=read(descriptor,bytes+used,wanted);
+        ssize_t count=io_read(descriptor,bytes+used,wanted);
         if (count<0 && errno==EINTR) continue;
         if (count<0) { int code=errno; free(bytes); stop("File handle read failed",strerror(code)); }
         if (!count) break; used+=(size_t)count; if (available) break;

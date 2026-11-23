@@ -4,6 +4,8 @@
 #endif
 #include <android/log.h>
 #include <android/looper.h>
+#include <android/asset_manager.h>
+#include <android/asset_manager_jni.h>
 #include <jni.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -28,6 +30,8 @@
 #include <limits.h>
 #include <sys/uio.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
+#include <linux/memfd.h>
 #include <sys/utsname.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -109,6 +113,15 @@ static const char *const extra_class_names[]={
     , "_OBJC_CLASS_$_ASIdentifierManager"
     , "_OBJC_CLASS_$_SKPayment", "_OBJC_CLASS_$_SKMutablePayment", "_OBJC_CLASS_$_SKPaymentTransaction"
     , "_OBJC_CLASS_$_NSMethodSignature", "_OBJC_CLASS_$_NSInvocation"
+    , "_OBJC_CLASS_$_UILocalNotification", "_OBJC_CLASS_$_UNUserNotificationCenter", "_OBJC_CLASS_$_UNNotificationSettings"
+    , "_OBJC_CLASS_$_UNNotificationContent", "_OBJC_CLASS_$_UNMutableNotificationContent", "_OBJC_CLASS_$_UNNotificationSound"
+    , "_OBJC_CLASS_$_UNNotificationRequest", "_OBJC_CLASS_$_UNNotificationTrigger", "_OBJC_CLASS_$_UNTimeIntervalNotificationTrigger"
+    , "_OBJC_CLASS_$_UNNotification", "_OBJC_CLASS_$_UNNotificationResponse"
+    , "_OBJC_CLASS_$_NSNetService"
+    , "_OBJC_CLASS_$_UITapGestureRecognizer", "_OBJC_CLASS_$_UIPanGestureRecognizer"
+    , "_OBJC_CLASS_$_UIWebView", "_OBJC_CLASS_$_WKWebView", "_OBJC_CLASS_$_WKWebViewConfiguration", "_OBJC_CLASS_$_WKPreferences"
+    , "_OBJC_CLASS_$_WKUserContentController", "_OBJC_CLASS_$_WKUserScript", "_OBJC_CLASS_$_WKNavigation", "_OBJC_CLASS_$_WKNavigationAction", "_OBJC_CLASS_$_WKFrameInfo"
+    , "_OBJC_CLASS_$_UIScrollView", "_OBJC_CLASS_$_UITextView"
 };
 static Word extra_class_objects[COUNT(extra_class_names)][4];
 static void initialize_guest_class(Word cls);
@@ -557,6 +570,8 @@ static void host_class_index_init(void) {
         {"UINavigationController","UIViewController"},{"UIImagePickerController","UINavigationController"},{"UITableViewController","UIViewController"},{"UICollectionViewController","UIViewController"},
         {"UIActivityViewController","UIViewController"},{"UIAlertController","UIViewController"},{"UISearchController","UIViewController"},{"UISplitViewController","UIViewController"},{"MTKView","UIView"},{"GLKView","UIView"},{"GLKViewController","UIViewController"},
         {"UIBlurEffect","UIVisualEffect"},{"UIPanGestureRecognizer","UIGestureRecognizer"},{"UITapGestureRecognizer","UIGestureRecognizer"},
+        {"UNMutableNotificationContent","UNNotificationContent"},{"UNTimeIntervalNotificationTrigger","UNNotificationTrigger"},
+        {"UIWebView","UIView"},{"WKWebView","UIView"},
         {"CAMetalLayer","CALayer"},{"CAGradientLayer","CALayer"},{"CAShapeLayer","CALayer"},{"CAEAGLLayer","CALayer"},
         {"NSDecimalNumber","NSNumber"},{"NSNumber","NSValue"},{"NSDirectoryEnumerator","NSEnumerator"},{"NSInvocationOperation","NSOperation"},{"NSBlockOperation","NSOperation"},{"SKMutablePayment","SKPayment"},
         {"NSDateFormatter","NSFormatter"},{"NSNumberFormatter","NSFormatter"},{"NSHTTPURLResponse","NSURLResponse"},
@@ -1477,6 +1492,21 @@ static double date_seconds(Word object) {
 }
 
 static Method find_implementation(Word object,const char *selector);
+static int io_open(const char *,int,mode_t);
+static ssize_t io_read(int,void *,size_t);
+static ssize_t io_pread(int,void *,size_t,off_t);
+static ssize_t io_readv(int,const struct iovec *,int);
+static off_t io_seek(int,off_t,int);
+static int io_close(int);
+static int io_fstat(int,struct stat *);
+static int io_stat(const char *,struct stat *);
+static void *io_mmap(void *,size_t,int,int,int,off_t);
+static int io_dup(int);
+static int io_dup2(int,int);
+static int bundle_fd_duplicate(int,int);
+static AAssetManager *bundle_assets;
+static jobject bundle_assets_owner;
+static struct stat bundle_archive_info;
 static const char *bundle_relative(const char *path) {
     if (!path) return NULL;
     if (*path=='/') ++path;
@@ -1505,8 +1535,8 @@ static const char *bundle_relative(const char *path) {
 #include "objc/metadata.inc"
 #include "../frameworks/network/network.inc"
 #include "../frameworks/network/connection.inc"
-#include "scheduling/operations.inc"
 #include "objc/objc.inc"
+#include "scheduling/operations.inc"
 #include "darwin/stdio.inc"
 #include "darwin/logging.inc"
 #include "../frameworks/foundation/corefoundation.inc"
@@ -1590,6 +1620,8 @@ static Method find_implementation_uncached(Word object, const char *selector) {
     const char *receiver = external ? external : class_name(class_receiver ? object : read_word(object));
     found=invocation_method(object,selector,receiver,class_receiver);
     if (found) return found;
+    found=net_service_method(object,selector,receiver,class_receiver);
+    if (found) return found;
     found=decimal_number_method(object,selector,receiver,class_receiver);
     if (found) return found;
     found=assertion_handler_method(object,selector,receiver,class_receiver);
@@ -1599,6 +1631,8 @@ static Method find_implementation_uncached(Word object, const char *selector) {
     found=cookie_method(object,selector,receiver,class_receiver);
     if (found) return found;
     found=response_cache_method(object,selector,receiver,class_receiver);
+    if (found) return found;
+    found=cookie_storage_method(object,selector,receiver,class_receiver);
     if (found) return found;
     found=foundation_collection_io_method(object,selector,receiver,class_receiver);
     if (found) return found;
@@ -1972,15 +2006,12 @@ __attribute__((used,noinline)) static int open_guest_file(const char *path,int f
     int translated=android_open_flags(flags);
     if (translated<0) return -1;
     if ((flags&(3|512|1024)) && !writable_sandbox_path(path)) return -1;
-    char *name=native_path(path);
-    if (!name) return -1;
     uint32_t mode=0;
     if (flags&512) memcpy(&mode,arguments,sizeof(mode));
-    int fd=open(name,translated,mode);
-    free(name);
+    int fd=io_open(path,translated,mode);
     if (fd>=0 && (flags&(16|32))) {
         int lock=(flags&32 ? LOCK_EX : LOCK_SH)|(flags&4 ? LOCK_NB : 0);
-        if (flock(fd,lock)) { int code=errno; close(fd); errno=code; return -1; }
+        if (flock(fd,lock)) { int code=errno; io_close(fd); errno=code; return -1; }
     }
     LOG("open %s fd=%d",path,fd);
     return fd;
@@ -2008,7 +2039,7 @@ __attribute__((used,noinline)) static int guest_fcntl(int fd,int command,const u
     }
     int argument;
     memcpy(&argument,arguments,sizeof(argument));
-    if (command==0) return fcntl(fd,F_DUPFD,argument);
+    if (command==0) return bundle_fd_duplicate(fd,fcntl(fd,F_DUPFD,argument));
     if (command==2) return fcntl(fd,F_SETFD,argument);
     if (command==4) {
         int flags=android_open_flags(argument);
@@ -2062,14 +2093,17 @@ struct DarwinStat {
     int64_t reserved[2];
 };
 
+static void guest_stat_assign(const struct stat *info,struct DarwinStat *output){
+    *output=(struct DarwinStat){.device=info->st_dev,.mode=info->st_mode,.links=info->st_nlink,.inode=info->st_ino,.uid=info->st_uid,.gid=info->st_gid,.special_device=info->st_rdev,.access=info->st_atim,.modified=info->st_mtim,.changed=info->st_ctim,.size=info->st_size,.blocks=info->st_blocks,.block_size=info->st_blksize};
+}
+static int guest_stat_path(const char *path,struct DarwinStat *output){struct stat info;if(io_stat(path,&info))return -1;guest_stat_assign(&info,output);return 0;}
+static int guest_lstat_path(const char *path,struct DarwinStat *output){struct stat info;if(bundle_relative(path) ? io_stat(path,&info) : lstat(path,&info))return -1;guest_stat_assign(&info,output);return 0;}
+static int guest_access(const char *path,int mode){if(!bundle_relative(path))return access(path,mode);if(mode&~(R_OK|W_OK|X_OK)){errno=EINVAL;return -1;}struct stat info;if(io_stat(path,&info))return -1;if((mode&W_OK) || ((mode&X_OK) && !S_ISDIR(info.st_mode))){errno=EACCES;return -1;}return 0;}
 static int guest_fstat(int fd,struct DarwinStat *output) {
     _Static_assert(sizeof(*output)==144 && offsetof(struct DarwinStat,size)==96,"iOS stat64 layout");
     struct stat native;
-    if (fstat(fd,&native)) return -1;
-    *output=(struct DarwinStat){.device=native.st_dev,.mode=native.st_mode,.links=native.st_nlink,
-        .inode=native.st_ino,.uid=native.st_uid,.gid=native.st_gid,.special_device=native.st_rdev,
-        .access=native.st_atim,.modified=native.st_mtim,.changed=native.st_ctim,.size=native.st_size,
-        .blocks=native.st_blocks,.block_size=native.st_blksize};
+    if (io_fstat(fd,&native)) return -1;
+    guest_stat_assign(&native,output);
     return 0;
 }
 
@@ -2079,7 +2113,7 @@ static void *guest_mmap(void *address,size_t length,int protection,int flags,int
     int translated=flags&3;
     if (flags&16) translated|=MAP_FIXED;
     if (flags&0x1000) translated|=MAP_ANONYMOUS;
-    void *result=mmap(address,length,protection,translated,fd,offset);
+    void *result=io_mmap(address,length,protection,translated,fd,offset);
     static unsigned logged;
     if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<8)
         LOG("mmap size=%lu protection=%d flags=0x%x fd=%d result=%p",length,protection,flags,fd,result);
@@ -2149,6 +2183,7 @@ static Word resolve_import(unsigned index) {
     Word accessibility=resolve_accessibility_import(name); if(accessibility)return accessibility;
     Word crypto=resolve_crypto_import(name); if (crypto) return crypto;
     Word http_message=resolve_http_message_import(name); if (http_message) return http_message;
+    Word stream=resolve_stream_import(name);if(stream)return stream;
     Word runloop_source=resolve_runloop_source_import(name); if (runloop_source) return runloop_source;
     Word uniform_type=resolve_uniform_type_import(name); if (uniform_type) return uniform_type;
     Word socket_import=resolve_socket_import(name);
@@ -2251,10 +2286,19 @@ static Word resolve_import(unsigned index) {
     if (!strcmp(name,"_statfs")) return (Word)guest_statfs;
     if (!strcmp(name,"_fcntl")) return (Word)darwin_fcntl;
     if (!strcmp(name,"_fstat")) return (Word)guest_fstat;
+    if (!strcmp(name,"_stat")) return (Word)guest_stat_path;
+    if (!strcmp(name,"_lstat")) return (Word)guest_lstat_path;
+    if (!strcmp(name,"_access")) return (Word)guest_access;
+    if (!strcmp(name,"_read")) return (Word)io_read;
+    if (!strcmp(name,"_pread")) return (Word)io_pread;
+    if (!strcmp(name,"_readv")) return (Word)io_readv;
+    if (!strcmp(name,"_lseek")) return (Word)io_seek;
+    if (!strcmp(name,"_dup")) return (Word)io_dup;
+    if (!strcmp(name,"_dup2")) return (Word)io_dup2;
     if (!strcmp(name,"_mmap")) return (Word)guest_mmap;
     if (!strcmp(name,"_madvise")) return (Word)guest_madvise;
     if (!strcmp(name,"_munmap")) return (Word)munmap;
-    if (!strcmp(name,"_close")) return (Word)close;
+    if (!strcmp(name,"_close")) return (Word)io_close;
     if (!strcmp(name,"_objc_msgSendSuper2")) return (Word)message_super2;
     if (!strcmp(name,"_objc_retainAutoreleaseReturnValue")) return (Word)metal_retain_autorelease;
     if (!strcmp(name,"_objc_unsafeClaimAutoreleasedReturnValue")) return (Word)identity;
@@ -2371,7 +2415,7 @@ static Word guest_find_export(const char *name,int main_only,Word storage[4]) {
         geometry_export,resolve_accessibility_import,resolve_crypto_import,resolve_core_import,resolve_keychain_import,resolve_rsa_import,resolve_secure_transport_import,
         resolve_atomic_import,
         resolve_audio_unit_import,resolve_audio_file_import,resolve_audio_queue_import,resolve_audio_services_import,resolve_objc_import,resolve_dynamic_import,
-        resolve_http_message_import,resolve_runloop_source_import,resolve_uniform_type_import,resolve_reachability_import,
+        resolve_http_message_import,resolve_stream_import,resolve_runloop_source_import,resolve_uniform_type_import,resolve_reachability_import,
         resolve_notification_import,resolve_interfaces_import,resolve_socket_import,resolve_thread_import,
         resolve_libsystem_import,resolve_malloc_zone_import,resolve_cpp_import,resolve_semaphore_import,
         resolve_kernel_import,resolve_dyld_import,resolve_signal_import,resolve_stdio_import,resolve_logging_import,resolve_sqlite_import
@@ -2459,6 +2503,14 @@ JNIEXPORT jstring JNICALL HOST_JNI(HostActivity_startGuest)(JNIEnv *env,jobject 
         may_unwind=1;
         (*env)->GetJavaVM(env,&java_vm);
         activity=(*env)->NewGlobalRef(env,instance);
+        jclass host_type=(*env)->GetObjectClass(env,instance);
+        jmethodID assets_method=(*env)->GetMethodID(env,host_type,"getAssets","()Landroid/content/res/AssetManager;");
+        jobject assets=(*env)->CallObjectMethod(env,instance,assets_method);
+        bundle_assets_owner=(*env)->NewGlobalRef(env,assets);bundle_assets=AAssetManager_fromJava(env,assets);
+        jmethodID apk_method=(*env)->GetMethodID(env,host_type,"installedApkPath","()Ljava/lang/String;");jstring apk_path=(*env)->CallObjectMethod(env,instance,apk_method);
+        if(apk_path){const char *apk=(*env)->GetStringUTFChars(env,apk_path,NULL);if(apk){stat(apk,&bundle_archive_info);(*env)->ReleaseStringUTFChars(env,apk_path,apk);}(*env)->DeleteLocalRef(env,apk_path);}
+        (*env)->DeleteLocalRef(env,assets);(*env)->DeleteLocalRef(env,host_type);
+        if(!bundle_assets)stop("Asset manager unavailable","Android bundle");
         preference_method=(*env)->GetMethodID(env,(*env)->GetObjectClass(env,instance),"preference","(Ljava/lang/String;I)I");
         bundle_file_method=(*env)->GetMethodID(env,(*env)->GetObjectClass(env,instance),"bundleFile","(Ljava/lang/String;)Ljava/lang/String;");
         bundle_exists_method=(*env)->GetMethodID(env,(*env)->GetObjectClass(env,instance),"bundleExists","(Ljava/lang/String;)Z");

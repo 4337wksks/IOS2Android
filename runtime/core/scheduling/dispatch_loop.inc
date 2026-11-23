@@ -2,6 +2,7 @@
 static void *dispatch_library;
 static void (*dispatch_drain_main)(void *);
 static int dispatch_main_fd=-1;
+static ALooper *platform_main_looper;
 static void *dispatch_export(const char *name) {
     if (!dispatch_library) dispatch_library=dlopen("libdispatch.so",RTLD_NOW|RTLD_LOCAL);
     if (!dispatch_library) stop("Loading libdispatch",dlerror());
@@ -41,6 +42,7 @@ static void initialize_dispatch_loop(void) {
     dispatch_drain_main=dispatch_export("_dispatch_main_queue_callback_4CF");
     ALooper *looper=ALooper_forThread();
     if (!get_port || !dispatch_drain_main || !looper) stop("Main runloop integration unavailable","libdispatch");
+    ALooper_acquire(looper);platform_main_looper=looper;
     dispatch_main_fd=get_port();
     if (dispatch_main_fd<0 || ALooper_addFd(looper,dispatch_main_fd,ALOOPER_POLL_CALLBACK,ALOOPER_EVENT_INPUT,drain_android_dispatch,NULL)!=1)
         stop("Main dispatch fd registration failed","Android Looper");

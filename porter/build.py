@@ -343,6 +343,7 @@ def build(context, core_only=False):
             status="complete",
             apk=str(candidate),
             resource_overlays=list(overlays),
+            package_revision=revision,
         )
         write_json(context.work / "build.json", summary)
         write_json(context.output / "build.json", summary)

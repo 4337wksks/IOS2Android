@@ -144,7 +144,6 @@ def build(context, extension_sources, standalone=False):
         composition,
         *sources,
         work / "image.S",
-        work / "shaders.S",
         work / "pvrtc.o",
         work / "texture_decode.o",
         "-lc++_shared",

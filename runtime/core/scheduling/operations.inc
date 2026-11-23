@@ -3,6 +3,7 @@
 struct OperationQueue;
 struct Operation {
     Word object, dependencies, blocks, completion, target, argument, name;
+    Word invocation,result;
     const char *action;
     void (*cleanup)(void *);
     void *cleanup_context;
@@ -157,6 +158,7 @@ static void operation_main(Word object) {
         Word block=blocks->items[index];
         ((void (*)(Word))read_word(block+16))(block);
     }
+    if(state->invocation){invocation_invoke(state->invocation);return;}
     if (state->target && state->action) {
         Method method=find_implementation(state->target,state->action);
         if (!method) stop("Unimplemented operation target",state->action);
@@ -201,9 +203,32 @@ static void operation_add_block(Word object,const char *selector,Word block) {
     sequence_add((void *)operation_state(object)->blocks,selector,(Word)_Block_copy((void *)block));
 }
 static Word invocation_operation(Word self,const char *selector,Word target,const char *action,Word argument) {
+    Word signature=target && action ? signature_for_selector(target,"methodSignatureForSelector:",action) : 0;
+    if(!signature)stop("Invalid invocation operation target",selector);
+    struct SignatureState *types=signature_state(signature);if(types->count>3 || (types->count==3 && types->arguments[2].code!='@'))stop("Invocation operation needs zero or one object argument",selector);
     struct Operation *state=operation_state(self);
     state->target=target; state->action=action; state->argument=argument;
+    state->invocation=invocation_create(external_class("_OBJC_CLASS_$_NSInvocation"),selector,signature);
+    invocation_target(state->invocation,selector,target);invocation_selector(state->invocation,selector,action);
+    if(types->count==3)invocation_set_argument(state->invocation,selector,&argument,2);
+    invocation_retain_arguments(state->invocation);
     return self;
+}
+static Word invocation_operation_init_invocation(Word object,const char *selector,Word invocation) {
+    if(!invocation)stop("Nil invocation",selector);invocation_state(invocation);struct Operation *state=operation_state(object);
+    state->invocation=invocation;state->target=invocation_property(invocation,"target");state->action=(void *)invocation_property(invocation,"selector");
+    invocation_retain_arguments(invocation);return object;
+}
+static Word invocation_operation_get_invocation(Word object) { return operation_state(object)->invocation; }
+static Word invocation_operation_result(Word object,const char *selector) {
+    struct Operation *state=operation_state(object);if(!operation_finished(object))return 0;
+    if(operation_cancelled(object))stop("NSInvocationOperationCancelledException",selector);
+    if(!state->invocation)return 0;
+    struct InvocationState *v=invocation_state(state->invocation);struct InvocationType *type=&signature_state(v->signature)->result;
+    if(type->code=='v')stop("NSInvocationOperationVoidResultException",selector);
+    if(type->code=='@' || type->code=='#')return read_word((Word)v->result);
+    if(!state->result)state->result=value_encoded(external_class("_OBJC_CLASS_$_NSValue"),selector,v->result,type->encoding);
+    return state->result;
 }
 
 static Word main_queue(Word cls) { main_operation_queue.isa=cls; return (Word)&main_operation_queue; }
@@ -411,6 +436,11 @@ static Method operations_method(Word object,const char *selector,const char *rec
         if (!strcmp(selector,"completionBlock")) return (Method)operation_get_completion;
         if (!strcmp(selector,"addExecutionBlock:")) return (Method)operation_add_block;
         if (!strcmp(selector,"initWithTarget:selector:object:")) return (Method)invocation_operation;
+        if(base && !strcmp(base,"_OBJC_CLASS_$_NSInvocationOperation")){
+            if(!strcmp(selector,"initWithInvocation:"))return (Method)invocation_operation_init_invocation;
+            if(!strcmp(selector,"invocation"))return (Method)invocation_operation_get_invocation;
+            if(!strcmp(selector,"result"))return (Method)invocation_operation_result;
+        }
         if (!strcmp(selector,"willChangeValueForKey:")) return (Method)noop;
         if (!strcmp(selector,"didChangeValueForKey:")) return (Method)operation_changed;
     }

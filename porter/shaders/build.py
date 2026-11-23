@@ -390,7 +390,7 @@ def build_shader_pack(source, work, plan):
                           str(len(original)), str(first_entry), str(len(entries) - first_entry), str(int(is_source))])
         report.append({'name': library['name'], 'sha256': library['sha256'],
                        'entries': len(entries) - first_entry, 'status': 'packed' if candidates_for_library else 'translation_pending'})
-    header = [f'#define I2A_SHADER_PACK_VERSION {SHADER_PACK_VERSION}']
+    header = [f'#define I2A_SHADER_PACK_VERSION {SHADER_PACK_VERSION}', f'#define I2A_SHADER_PACK_BYTES {len(binary)}']
     sites=plan.get('diagnostics',[])
     header += [f'#define I2A_SHADER_DIAGNOSTIC_COUNT {len(sites)}',
                'struct ShaderDiagnosticSite { const char *shader,*operation; unsigned line; };']
@@ -406,9 +406,7 @@ def build_shader_pack(source, work, plan):
     emit_struct_array(header, 'ShaderLibrarySpec', 'shader_libraries', libraries)
     (work / 'shaders.h').write_text('\n'.join(header) + '\n', encoding='utf8')
     (work / 'shaders.bin').write_bytes(binary)
-    (work / 'shaders.S').write_text('.section .rodata.guest_spirv,"a",%progbits\n.balign 16\n'
-        '.global guest_spirv_data\n.hidden guest_spirv_data\nguest_spirv_data:\n.incbin "shaders.bin"\n'
-        '.section .note.GNU-stack,"",%progbits\n', encoding='utf8')
+    (work / 'shaders.S').unlink(missing_ok=True)
     summary = dict(version=SHADER_PACK_VERSION, libraries=len(libraries), entries=len(entries),
                    unique_modules=len(modules), packed_bytes=len(binary), arguments=len(arguments),
                    members=len(members), bindings=len(bindings), libraries_detail=report,

@@ -209,7 +209,8 @@ static const char *signature_bridge_encoding(const char *selector) {
         {"setNeedsDisplay","v16@0:8"},{"setNeedsLayout","v16@0:8"},{"layoutIfNeeded","v16@0:8"},
         {"objectForKey:","@24@0:8@16"},{"setObject:forKey:","v32@0:8@16@24"},{"valueForKey:","@24@0:8@16"},
         {"setValue:forKey:","v32@0:8@16@24"},{"objectAtIndex:","@24@0:8Q16"},{"compare:","q24@0:8@16"},
-        {"setAutomaticallyAdjustsScrollViewInsets:","v20@0:8B16"}
+        {"setAutomaticallyAdjustsScrollViewInsets:","v20@0:8B16"},
+        {"openURL:","B24@0:8@16"},{"canOpenURL:","B24@0:8@16"}
     };
     for(unsigned i=0;i<COUNT(known);++i)if(!strcmp(known[i].name,selector))return known[i].types;return NULL;
 }
