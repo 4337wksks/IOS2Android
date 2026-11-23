@@ -48,7 +48,7 @@ static Method ui_paragraph_method(Word object,const char *selector,const char *r
 }
 
 struct TextFieldState {
-    Word object,properties[17],attributed,detection;
+    Word object,properties[17],attributed,detection,synced_owner;
     struct GuestInsets insets;
     struct GuestRange selection;
     unsigned multiline,editable,selectable,revision,synced_revision,synced,closed,delegate_epoch,delegate_cached;

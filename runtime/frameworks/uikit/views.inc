@@ -5,6 +5,11 @@ struct GuestInsets { double top,left,bottom,right; };
 static void ui_label_sync(Word);
 static void ui_web_sync(Word);
 static void ui_input_sync(Word);
+static void ui_table_sync(Word);
+static void ui_table_scroll(Word,unsigned);
+static void ui_table_controller_load(Word,Word);
+static void ui_table_controller_appear(Word);
+static uint32_t ui_cell_background(Word,uint32_t);
 static void ui_scroll_input_options(Word,float *,int *);
 static void ui_scroll_input_delegate(Word,Word);
 static Word ui_alert_initialize(Word,const char *);
@@ -31,7 +36,8 @@ static void view_animation_change(Word);
 struct ViewState {
     Word object,parent,children,layer,controller,view,owner_window,image_name,background,presented,presenting,modal_alert,popover,navigation_bar,storyboard,nib_name,nib_bundle;
     Word navigation_item,title,prompt,left_item,right_item,back_item,archived_graph;
-    void *control,*web,*scroll,*input;
+    void *control,*web,*scroll,*input,*table,*cell;
+    Word host_container;
     Word accessibility_label;
     Word constraints,gestures;
     struct GuestRect margins;
@@ -73,6 +79,7 @@ static void view_sync_subtree(Word object) {
     ui_label_sync(object);
     ui_web_sync(object);
     ui_input_sync(object);
+    ui_table_sync(object);
     struct Sequence *children=(void *)state->children;
     for (size_t i=0;i<children->count;++i) view_sync_subtree(children->items[i]);
 }
@@ -269,6 +276,7 @@ static void controller_load_view(Word object,const char *selector) {
     if (state->deferred_storyboard || state->nib_name) stop("Archived controller view decoding unavailable",selector);
     Word cls=read_word(object),view_cls=external_class(class_inherits(cls,external_class("_OBJC_CLASS_$_UITableViewController")) ? "_OBJC_CLASS_$_UITableView" : "_OBJC_CLASS_$_UIView");
     state->view=view_init_frame(host_allocate(view_cls),selector,screen_bounds());
+    ui_table_controller_load(object,state->view);
 }
 static Word controller_view(Word object) {
     struct ViewState *state=view_state(object);
@@ -517,7 +525,7 @@ static void window_present(void *value) {
     Word object=(Word)value;struct ViewState *window=view_state(object);window->appearance_pending=0;
     Word controller=window->controller;if(window->hidden || !controller || !window_lifecycle_ready)return;
     struct ViewState *state=view_state(controller);Word view=controller_view(controller);if(!view)return;
-    if(!state->appeared){Method callback=find_implementation(controller,"viewWillAppear:");if(callback)callback(controller,"viewWillAppear:",0,0,0,0);}
+    if(!state->appeared){ui_table_controller_appear(controller);Method callback=find_implementation(controller,"viewWillAppear:");if(callback)callback(controller,"viewWillAppear:",0,0,0,0);}
     if(window->hidden || window->controller!=controller)return;
     if(view_state(view)->parent!=object)view_add(object,"Window presentation",view);
     controller_geometry(controller);view_request_layout(view,"Window presentation");view_layout_if_needed(view,"Window presentation");view_sync_subtree(view);
@@ -569,6 +577,10 @@ static void view_animation_free(struct ViewAnimation *context) {
     while (context->sources) { struct ViewOpacity *item=context->sources; context->sources=item->next; free(item); }
     free(context);
 }
+static Word view_opacity_parent(Word object) {
+    struct ViewState *view=view_state(object);Word parent=view->parent;
+    return view->host_container ? 0 : parent;
+}
 static void view_animate(Word cls,const char *selector,double duration,double delay,Word options,Word animation,Word completion) {
     if (!isfinite(duration) || !isfinite(delay) || duration<0 || delay<0 || duration+delay>(double)INT64_MAX/1000.0) stop("Invalid animation time",selector);
     struct ViewAnimation *context=calloc(1,sizeof(*context)); if (!context) stop("Allocation failed",selector);
@@ -579,7 +591,7 @@ static void view_animate(Word cls,const char *selector,double duration,double de
     active_guest_call_boundary=call.previous; view_animation=context->previous;
     if (failed) { char failure[sizeof(status)]; memcpy(failure,status,sizeof(failure)); view_animation_free(context); stop("UIView animation failed",failure); }
     unsigned count=0,sources=0,ancestors=0;
-    for (struct ViewOpacity *item=context->items;item;item=item->next) { ++count; for (Word object=item->object;object;object=view_state(object)->parent) ++ancestors; }
+    for (struct ViewOpacity *item=context->items;item;item=item->next) { ++count; for (Word object=item->object;object;object=view_opacity_parent(object)) ++ancestors; }
     for (struct ViewOpacity *item=context->sources;item;item=item->next) ++sources;
     if (!count && !completion) { view_animation_free(context); return; }
     JNIEnv *env=attached_environment(selector); static jmethodID animate;
@@ -596,7 +608,7 @@ static void view_animate(Word cls,const char *selector,double duration,double de
     i=0; jint cursor=0;
     for (struct ViewOpacity *item=context->items;item;item=item->next,++i) {
         jlong token=item->object; (*env)->SetLongArrayRegion(env,tokens,i,1,&token); (*env)->SetIntArrayRegion(env,offsets,i,1,&cursor);
-        for (Word object=item->object;object;object=view_state(object)->parent,++cursor) {
+        for (Word object=item->object;object;object=view_opacity_parent(object),++cursor) {
             token=object; jfloat alpha=(float)view_state(object)->alpha;
             (*env)->SetLongArrayRegion(env,chain,cursor,1,&token); (*env)->SetFloatArrayRegion(env,model,cursor,1,&alpha);
         }
@@ -1067,17 +1079,21 @@ static void ui_application_start(Word principal,Word delegate_name){
     schedule_main_function(application_activate,NULL);
 }
 
-static void view_host_geometry(Word object,float metrics[11],int options[3]) {
+static Word view_host_geometry(Word object,float metrics[11],int options[3]) {
     struct ViewState *view=view_state(object);double scale=screen_scale(),x=view->frame.x,y=view->frame.y,alpha=view->alpha;int visible=!view->hidden,enabled=view->interaction;
-    for(Word parent=view->parent;parent;parent=view_state(parent)->parent){struct ViewState *ancestor=view_state(parent);x+=ancestor->frame.x-ancestor->bounds.x;y+=ancestor->frame.y-ancestor->bounds.y;alpha*=ancestor->alpha;visible&=!ancestor->hidden;enabled&=ancestor->interaction;}
-    struct GuestRect clip=screen_bounds();double px=x-view->frame.x,py=y-view->frame.y;
-    for(Word parent=view->parent;parent;parent=view_state(parent)->parent){struct ViewState *ancestor=view_state(parent);px+=ancestor->bounds.x;py+=ancestor->bounds.y;
+    Word container=view->host_container ? object : 0;
+    if(container)x=y=0;
+    for(Word parent=container ? 0 : view->parent;parent;parent=view_state(parent)->parent){struct ViewState *ancestor=view_state(parent);alpha*=ancestor->alpha;visible&=!ancestor->hidden;enabled&=ancestor->interaction;if(ancestor->host_container){x-=ancestor->bounds.x;y-=ancestor->bounds.y;container=parent;break;}x+=ancestor->frame.x-ancestor->bounds.x;y+=ancestor->frame.y-ancestor->bounds.y;}
+    struct GuestRect clip=container ? (struct GuestRect){0,0,view_state(container)->bounds.width,view_state(container)->bounds.height} : screen_bounds();double px=x-view->frame.x,py=y-view->frame.y;
+    for(Word parent=container==object ? 0 : view->parent;parent;parent=view_state(parent)->parent){struct ViewState *ancestor=view_state(parent);px+=ancestor->bounds.x;py+=ancestor->bounds.y;
+        if(parent==container)break;
         if(ancestor->clips){double right=fmin(clip.x+clip.width,px+ancestor->frame.width),bottom=fmin(clip.y+clip.height,py+ancestor->frame.height);clip.x=fmax(clip.x,px);clip.y=fmax(clip.y,py);clip.width=fmax(0,right-clip.x);clip.height=fmax(0,bottom-clip.y);}
         px-=ancestor->frame.x;py-=ancestor->frame.y;
     }
     double left=fmax(x,clip.x),top=fmax(y,clip.y),right=fmin(x+view->frame.width,clip.x+clip.width),bottom=fmin(y+view->frame.height,clip.y+clip.height);
     float values[]={(float)(x*scale),(float)(y*scale),(float)(view->frame.width*scale),(float)(view->frame.height*scale),(float)alpha,(float)(view->layer ? view_state(view->layer)->z : 0),(float)view_window_level(object),(float)((left-x)*scale),(float)((top-y)*scale),(float)(fmax(0,right-left)*scale),(float)(fmax(0,bottom-top)*scale)};
     memcpy(metrics,values,sizeof(values));options[0]=visible && alpha>0 && right>left && bottom>top;options[1]=view_window(object)!=0;options[2]=enabled;
+    return container ? view_state(container)->host_container : 0;
 }
 static Method views_method(Word object,const char *selector,const char *receiver,int class_receiver) {
     if (!receiver) return NULL;

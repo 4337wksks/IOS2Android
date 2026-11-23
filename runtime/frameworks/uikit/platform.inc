@@ -91,10 +91,10 @@ static Word ui_pasteboard_has_text(Word object,const char *selector) { return ui
 struct WebState;
 struct WebBinding { struct WebState *web;struct WebBinding *next; };
 struct WebConfiguration { Word preferences,controller,suffix;Word media;struct WebBinding *bindings; };
-struct ScrollState { struct WebState *web;struct GuestPoint offset;struct GuestSize size;struct GuestInsets insets;Word delegate;unsigned enabled,vertical,horizontal,directional,top,epoch,cached;Method callback; };
+struct ScrollState { struct WebState *web;struct GuestPoint offset;struct GuestSize size;struct GuestInsets insets;Word delegate;unsigned enabled,vertical,horizontal,directional,top,epoch,cached,animated;Method callback; };
 struct WebEvaluation { Word identifier,block;struct WebEvaluation *next; };
 struct WebState {
-    Word object,configuration,delegate,ui_delegate,request,navigation,url,title,user_agent,scroll;
+    Word object,configuration,delegate,ui_delegate,request,navigation,url,title,user_agent,scroll,synced_owner;
     unsigned references,wk,back,forward,scales,epoch,cached,committed;_Atomic unsigned closed,loading;
     double progress;
     struct WebBinding preferences_binding,controller_binding,configuration_binding;
@@ -157,11 +157,11 @@ static Word web_init(Word object,const char *selector,struct GuestRect frame,Wor
 static Word web_init_frame(Word object,const char *selector,struct GuestRect frame) { return web_init(object,selector,frame,0); }
 static Word web_init_plain(Word object,const char *selector) { return web_init(object,selector,(struct GuestRect){0},0); }
 static void ui_web_sync(Word object) {
-    struct ViewState *view=view_state(object);struct WebState *web=view->web;if(!web || web->closed)return;float metrics[11];int options[4];view_host_geometry(object,metrics,options);options[3]=(int)label_argb(view->background,0xffffffff);
-    if(web->synced && !memcmp(web->metrics,metrics,sizeof(metrics)) && !memcmp(web->options,options,sizeof(options)))return;memcpy(web->metrics,metrics,sizeof(metrics));memcpy(web->options,options,sizeof(options));web->synced=1;
+    struct ViewState *view=view_state(object);struct WebState *web=view->web;if(!web || web->closed)return;float metrics[11];int options[4];Word owner=view_host_geometry(object,metrics,options);options[3]=(int)label_argb(view->background,0xffffffff);
+    if(web->synced && web->synced_owner==owner && !memcmp(web->metrics,metrics,sizeof(metrics)) && !memcmp(web->options,options,sizeof(options)))return;memcpy(web->metrics,metrics,sizeof(metrics));memcpy(web->options,options,sizeof(options));web->synced=1;web->synced_owner=owner;
     struct ViewState *scroll=view_state(web->scroll);scroll->frame=(struct GuestRect){0,0,view->frame.width,view->frame.height};scroll->bounds.width=view->frame.width;scroll->bounds.height=view->frame.height;
-    JNIEnv *env=attached_environment("Web geometry");static jmethodID method;if(!method){jclass type=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,type,"syncGuestWeb","(J[F[I)V");(*env)->DeleteLocalRef(env,type);}
-    jfloatArray m=(*env)->NewFloatArray(env,COUNT(metrics));jintArray o=(*env)->NewIntArray(env,COUNT(options));(*env)->SetFloatArrayRegion(env,m,0,COUNT(metrics),metrics);(*env)->SetIntArrayRegion(env,o,0,COUNT(options),options);(*env)->CallVoidMethod(env,activity,method,(jlong)object,m,o);(*env)->DeleteLocalRef(env,m);(*env)->DeleteLocalRef(env,o);
+    JNIEnv *env=attached_environment("Web geometry");static jmethodID method;if(!method){jclass type=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,type,"syncGuestWeb","(JJ[F[I)V");(*env)->DeleteLocalRef(env,type);}
+    jfloatArray m=(*env)->NewFloatArray(env,COUNT(metrics));jintArray o=(*env)->NewIntArray(env,COUNT(options));(*env)->SetFloatArrayRegion(env,m,0,COUNT(metrics),metrics);(*env)->SetIntArrayRegion(env,o,0,COUNT(options),options);(*env)->CallVoidMethod(env,activity,method,(jlong)object,(jlong)owner,m,o);(*env)->DeleteLocalRef(env,m);(*env)->DeleteLocalRef(env,o);
     if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);stop("Android web geometry failed","Web view");}
 }
 static Word web_host_url(Word url) {
@@ -289,6 +289,7 @@ static void scroll_notify(Word object) {
 }
 static void scroll_apply(Word object) {
     struct ScrollState *scroll=scroll_state(object);struct ViewState *view=view_state(object);view->bounds.x=scroll->offset.x;view->bounds.y=scroll->offset.y;view_sync_subtree(object);
+    ui_table_scroll(object,scroll->animated);
     if(scroll->web){Word payload=empty_map(external_class("_OBJC_CLASS_$_NSDictionary"));const char *keys[]={"x","y","top","left","bottom","right"};double values[]={scroll->offset.x,scroll->offset.y,scroll->insets.top,scroll->insets.left,scroll->insets.bottom,scroll->insets.right};for(unsigned i=0;i<COUNT(keys);++i)web_field(payload,keys[i],real_number_factory(external_class("_OBJC_CLASS_$_NSNumber"),"Scroll values",values[i]));web_field(payload,"enabled",number_bool(external_class("_OBJC_CLASS_$_NSNumber"),"Scroll state",scroll->enabled));web_field(payload,"vertical",number_bool(external_class("_OBJC_CLASS_$_NSNumber"),"Scroll state",scroll->vertical));web_field(payload,"horizontal",number_bool(external_class("_OBJC_CLASS_$_NSNumber"),"Scroll state",scroll->horizontal));web_command(scroll->web,"scroll",payload);}
 }
 static void scroll_set_offset(Word object,const char *selector,struct GuestPoint point) { if(!isfinite(point.x) || !isfinite(point.y))stop("Invalid scroll offset",selector);struct ScrollState *scroll=scroll_state(object);if(!memcmp(&scroll->offset,&point,sizeof(point)))return;scroll->offset=point;scroll_apply(object);scroll_notify(object); }

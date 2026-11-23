@@ -5,7 +5,17 @@ import android.view.View;
 import android.widget.FrameLayout;
 import java.util.IdentityHashMap;
 
-final class LabelOverlay extends FrameLayout {
+class LabelOverlay extends FrameLayout {
+    static void detach(View child) {
+        if(child.getParent() instanceof android.view.ViewGroup)((android.view.ViewGroup)child.getParent()).removeView(child);
+    }
+    static void attach(LabelOverlay parent,View child) {
+        if(child.getParent()==parent)return;
+        detach(child);parent.addView(child);
+    }
+    static void updateVisibility(View child,boolean visible) {
+        if(child.getParent() instanceof LabelOverlay)((LabelOverlay)child.getParent()).visibility(child,visible);
+    }
     private static final class Entry {
         final View view;
         float depth, windowLevel;
@@ -51,7 +61,7 @@ final class LabelOverlay extends FrameLayout {
     @Override public void onViewRemoved(View child) {
         super.onViewRemoved(child);
         Entry entry=entries.remove(child);
-        if (entry!=null && entry.visible) --visibleCount;
+        if (entry!=null && entry.visible && --visibleCount==0 && getParent()!=null)getParent().requestTransparentRegion(this);
         order=null; dirty=true;
     }
     @Override public void bringChildToFront(View child) {

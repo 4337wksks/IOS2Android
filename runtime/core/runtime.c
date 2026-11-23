@@ -1580,6 +1580,7 @@ static const char *bundle_relative(const char *path) {
 #include "../frameworks/uikit/input.inc"
 #include "../frameworks/uikit/labels.inc"
 #include "../frameworks/uikit/platform.inc"
+#include "../frameworks/uikit/tables.inc"
 #include "../frameworks/uikit/share.inc"
 #include "../frameworks/uikit/photos.inc"
 #include "../frameworks/uikit/alerts.inc"
@@ -1662,6 +1663,8 @@ static Method framework_implementation(Word object,const char *selector,const ch
     found=ui_input_method(object,selector,receiver,class_receiver);
     if (found) return found;
     found=ui_paragraph_method(object,selector,receiver,class_receiver);
+    if (found) return found;
+    found=ui_tables_method(object,selector,receiver,class_receiver);
     if (found) return found;
     found=ui_labels_method(object,selector,receiver,class_receiver);
     if (found) return found;

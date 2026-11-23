@@ -160,7 +160,7 @@ final class TextInput implements View.OnAttachStateChangeListener,
         private final java.util.HashMap<Long,Entry> entries=new java.util.HashMap<>();
         Editors(android.app.Activity activity,LabelOverlay overlay,Callback callback){this.activity=activity;this.overlay=overlay;this.callback=callback;}
         View view(long token){Entry entry=entries.get(token);return entry==null ? null : entry.editor;}
-        void sync(long token,CharSequence text,float[] metrics,int[] options){Entry entry=entries.get(token);if(entry==null){entry=new Entry(token);entries.put(token,entry);}entry.sync(text,metrics,options);}
+        void sync(long token,LabelOverlay parent,CharSequence text,float[] metrics,int[] options){Entry entry=entries.get(token);if(entry==null){entry=new Entry(token);entries.put(token,entry);}entry.sync(parent,text,metrics,options);}
         boolean focus(long token,boolean focused){Entry entry=entries.get(token);if(entry==null)return false;entry.updating=true;try{if(focused){if(entry.editable)entry.ime.requestShow();else entry.editor.requestFocus();}else{entry.ime.cancel();((InputMethodManager)activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE)).hideSoftInputFromWindow(entry.editor.getWindowToken(),0);entry.editor.clearFocus();}}finally{entry.updating=false;}return true;}
         void remove(long token){Entry entry=entries.remove(token);if(entry!=null)entry.close();}
         void close(){for(Entry entry:entries.values())entry.close();entries.clear();}
@@ -183,15 +183,15 @@ final class TextInput implements View.OnAttachStateChangeListener,
                 });
                 editor.setOnFocusChangeListener((view,focused)->{if(updating)return;if(!callback.focus(token,focused)){updating=true;try{if(focused)editor.clearFocus();else editor.requestFocus();}finally{updating=false;}}});
             }
-            void sync(CharSequence text,float[] m,int[] o){
+            void sync(LabelOverlay parent,CharSequence text,float[] m,int[] o){
                 updating=true;
                 try{
                     scale=m[18];insetX=m[19];insetY=m[20];editable=o[3]!=0;selectable=o[4]!=0;scrolling=o[17]!=0;directional=o[20]!=0;
-                    if(o[1]!=0 && editor.getParent()==null)overlay.addView(editor);
-                    else if(o[1]==0 && editor.getParent()!=null){ime.cancel();overlay.visibility(editor,false);overlay.removeView(editor);callback.detached(token);}
+                    if(o[1]!=0)LabelOverlay.attach(parent,editor);
+                    else if(editor.getParent()!=null){ime.cancel();LabelOverlay.detach(editor);callback.detached(token);}
                     int width=Math.max(0,(int)Math.ceil(m[2])),height=Math.max(0,(int)Math.ceil(m[3]));android.view.ViewGroup.LayoutParams old=editor.getLayoutParams();
                     if(old==null || old.width!=width || old.height!=height)editor.setLayoutParams(new android.widget.FrameLayout.LayoutParams(width,height));
-                    editor.setTranslationX(m[0]);editor.setTranslationY(m[1]);callback.alpha(token,editor,m[4]);overlay.depth(editor,m[5],m[6]);
+                    editor.setTranslationX(m[0]);editor.setTranslationY(m[1]);callback.alpha(token,editor,m[4]);parent.depth(editor,m[5],m[6]);
                     editor.setClipBounds(new android.graphics.Rect((int)m[7],(int)m[8],(int)Math.ceil(m[7]+m[9]),(int)Math.ceil(m[8]+m[10])));
                     editor.setPadding(Math.round(m[12]),Math.round(m[13]),Math.round(m[14]),Math.round(m[15]));editor.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX,m[11]);
                     int type=TextInput.inputType(o[7],o[9],o[10]!=0);
@@ -205,12 +205,12 @@ final class TextInput implements View.OnAttachStateChangeListener,
                     if(!editable && selectable && links!=0)editor.setMovementMethod(android.text.method.LinkMovementMethod.getInstance());else if(selectable || editable)editor.setMovementMethod(android.text.method.ArrowKeyMovementMethod.getInstance());else editor.setMovementMethod(null);
                     int start=Math.min(editor.length(),Math.max(0,o[15])),end=Math.min(editor.length(),Math.max(start,o[16]));if(editor.getSelectionStart()!=start || editor.getSelectionEnd()!=end)editor.setSelection(start,end);
                     editor.setVerticalScrollBarEnabled(o[18]!=0);editor.setHorizontalScrollBarEnabled(o[19]!=0);editor.scrollTo(Math.round(m[16]),Math.round(m[17]));
-                    editor.setEnabled(o[2]!=0);editor.setVisibility(o[0]!=0 ? View.VISIBLE : View.GONE);overlay.visibility(editor,o[0]!=0 && m[4]>0);
+                    editor.setEnabled(o[2]!=0);editor.setVisibility(o[0]!=0 ? View.VISIBLE : View.GONE);parent.visibility(editor,o[0]!=0 && m[4]>0);
                 }finally{updating=false;}
             }
             void selection(){if(!updating && editor.getSelectionStart()>=0)callback.selection(token,Math.min(editor.getSelectionStart(),editor.getSelectionEnd()),Math.max(editor.getSelectionStart(),editor.getSelectionEnd()));}
             void scroll(){if(!updating && editor.getLayout()!=null && scale>0)callback.scroll(token,(editor.getScrollX()-insetX)/scale,(editor.getScrollY()-insetY)/scale,editor.contentWidth()/scale,editor.contentHeight()/scale);}
-            void close(){updating=true;ime.cancel();editor.clearFocus();editor.entry=null;overlay.visibility(editor,false);overlay.removeView(editor);callback.detached(token);}
+            void close(){updating=true;ime.cancel();editor.clearFocus();editor.entry=null;LabelOverlay.detach(editor);callback.detached(token);}
         }
         private final class Editor extends EditText {
             Entry entry;

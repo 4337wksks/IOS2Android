@@ -71,7 +71,8 @@ APKs are written to `out/<application-id>/<CFBundleVersion>/dev|release/` in the
 ### Compatibility
 
 - Encrypted binaries and chained fixups are not supported. Dynamic library and symbol loading also have coverage limits.
-- Scene lifecycle, complex NIBs, layout, animation, scrolling, tables, and text editing still have compatibility gaps; not every native interface can be rendered.
+- Scene lifecycle, complex NIBs, layout, animation, general scrolling, and text editing still have compatibility gaps; not every native interface can be rendered.
+- Tables still lack constraint-based automatic row heights, NIB cells, editing/reordering, insertion/deletion animations, and complete grouped styling. Offscreen row geometry may use estimated heights.
 - Web pages support basic loading and interaction. Multiple windows, downloads, and some navigation and scripting APIs remain unsupported.
 - Metal-to-Vulkan and MSL/AIR translation cover only the interfaces and translation paths currently implemented.
 - Audio format support is limited, and real-time AudioQueue playback is not implemented.

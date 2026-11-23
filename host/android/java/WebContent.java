@@ -65,24 +65,23 @@ final class WebContent {
         if(page==null) { page=new Page(token); pages.put(token,page); }
         return page;
     }
-    void sync(long token,float[] metrics,int[] options) {
+    void sync(long token,LabelOverlay parent,float[] metrics,int[] options) {
             if(closed || activity.isDestroyed())return;
             Page page=page(token);
             if(options[1]==0) {
-                overlay.visibility(page.panel,false);
-                overlay.removeView(page.panel); callback.detached(token);
+                LabelOverlay.detach(page.panel); callback.detached(token);
                 return;
             }
-            if(page.panel.getParent()==null) overlay.addView(page.panel);
+            LabelOverlay.attach(parent,page.panel);
             int width=Math.max(0,(int)Math.ceil(metrics[2])),height=Math.max(0,(int)Math.ceil(metrics[3]));
             android.view.ViewGroup.LayoutParams previous=page.panel.getLayoutParams();
             if(previous==null || previous.width!=width || previous.height!=height)page.panel.setLayoutParams(new FrameLayout.LayoutParams(width,height));
             page.panel.setTranslationX(metrics[0]);page.panel.setTranslationY(metrics[1]);
-            callback.alpha(token,page.panel,metrics[4]);overlay.depth(page.panel,metrics[5],metrics[6]);
+            callback.alpha(token,page.panel,metrics[4]);parent.depth(page.panel,metrics[5],metrics[6]);
             page.panel.setClipBounds(new android.graphics.Rect((int)metrics[7],(int)metrics[8],(int)Math.ceil(metrics[7]+metrics[9]),(int)Math.ceil(metrics[8]+metrics[10])));
             page.panel.setVisibility(options[0]!=0 ? View.VISIBLE : View.GONE);page.enabled=options[2]!=0;page.background=options[3];
             if(page.web!=null){page.web.setEnabled(page.enabled);page.web.setBackgroundColor(page.background);}
-            overlay.visibility(page.panel,options[0]!=0 && metrics[4]>0);
+            parent.visibility(page.panel,options[0]!=0 && metrics[4]>0);
     }
     View view(long token) { Page page=pages.get(token);return page==null ? null : page.panel; }
     void command(long token,String action,String input) {
@@ -243,7 +242,7 @@ final class WebContent {
         void removeScripts(){if(scriptHandler!=null){try{removeStartScript.invoke(scriptHandler);}catch(Exception ignored){}scriptHandler=null;}}
         void destroy() {
             destroyed=true;cancelDialogs();removeScripts();
-            callback.detached(token);overlay.visibility(panel,false);overlay.removeView(panel);if(web!=null){panel.removeView(web);web.stopLoading();web.destroy();web=null;}
+            callback.detached(token);LabelOverlay.detach(panel);if(web!=null){panel.removeView(web);web.stopLoading();web.destroy();web=null;}
         }
     }
     private WebResourceResponse bundleResource(WebResourceRequest request) {

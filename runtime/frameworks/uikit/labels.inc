@@ -1,13 +1,13 @@
 /* UIKit keeps ownership of content and positions. Android lays out the same
  * attributed runs and native attachment bounds for both sizeToFit and drawing. */
-struct LabelState { Word object,text,attributed,font,color,shadow,synced_text; jobject rich_text; long alignment,lines,line_break; double preferred_width;int adjusts,synced; float metrics[12]; jint options[9]; struct LabelState *next;
+struct LabelState { Word object,text,attributed,font,color,shadow,synced_text,synced_owner; jobject rich_text; long alignment,lines,line_break; double preferred_width;int adjusts,synced; float metrics[16]; jint options[9]; struct LabelState *next;
 #if I2A_DEVELOPMENT
     unsigned diagnostic_traces;
 #endif
 };
 struct ControlAppearance { Word state,title,image,color; struct ControlAppearance *next; };
 struct ControlAction { Word target,events; const char *selector; struct ControlAction *next; };
-struct ControlState { Word object,label,image,image_view,empty_title,default_color,synced_image,synced_accessibility,indicator_color; unsigned button,type,enabled,selected,highlighted,synced,indicator,animating,hides; struct GuestRect content_insets,title_insets,image_insets; struct ControlAppearance *appearances; struct ControlAction *actions; float metrics[10]; jint options[11]; };
+struct ControlState { Word object,label,image,image_view,empty_title,default_color,synced_image,synced_accessibility,indicator_color,synced_owner; unsigned button,type,enabled,selected,highlighted,synced,indicator,animating,hides; struct GuestRect content_insets,title_insets,image_insets; struct ControlAppearance *appearances; struct ControlAction *actions; float metrics[14]; jint options[11]; };
 static Word image_view_init(Word,const char *,Word);
 static void ui_control_sync(Word);
 static struct LabelState *label_states;
@@ -21,12 +21,12 @@ static struct LabelState *label_state(Word object) {
 }
 static int label_object(Word object) { const char *base=object ? external_base(read_word(object)) : NULL; return base && !strcmp(base,"_OBJC_CLASS_$_UILabel"); }
 static void label_collect_order(Word object,struct Sequence *order) {
-    if (label_object(object) || view_state(object)->control || view_state(object)->web || view_state(object)->input) sequence_add(order,"UIView drawing order",object);
+    if (label_object(object) || view_state(object)->control || view_state(object)->web || view_state(object)->input || view_state(object)->table) sequence_add(order,"UIView drawing order",object);
     struct Sequence *children=(void *)view_state(object)->children;
     for (size_t i=0;i<children->count;++i) label_collect_order(children->items[i],order);
 }
 static void ui_view_order_sync(Word object) {
-    while (view_state(object)->parent) object=view_state(object)->parent;
+    while (view_state(object)->parent && !view_state(object)->host_container) object=view_state(object)->parent;
     struct Sequence *order=(void *)sequence_empty(external_class("_OBJC_CLASS_$_NSArray")); label_collect_order(object,order);
     if (order->count) {
         JNIEnv *env=attached_environment("UIView drawing order"); static jmethodID method;
@@ -117,17 +117,17 @@ static struct LabelState *text_editor_label(struct TextFieldState *field) {
 }
 static void ui_input_sync(Word object) {
     struct ViewState *view=view_state(object);struct TextFieldState *field=view->input;if(!field || field->closed)return;
-    float metrics[21]={0};int options[22]={0};view_host_geometry(object,metrics,options);double scale=screen_scale();struct UIKitFont *font=(void *)field->properties[3];
+    float metrics[21]={0};int options[22]={0};Word owner=view_host_geometry(object,metrics,options);double scale=screen_scale();struct UIKitFont *font=(void *)field->properties[3];
     metrics[11]=(font ? font->size : 12)*scale;metrics[12]=(field->insets.left+5)*scale;metrics[13]=field->insets.top*scale;metrics[14]=(field->insets.right+5)*scale;metrics[15]=field->insets.bottom*scale;metrics[18]=scale;
     options[3]=field->editable;options[4]=field->selectable;options[5]=field->properties[10];options[6]=field->properties[14];options[7]=field->properties[13];options[8]=field->properties[6];options[9]=field->properties[9];options[10]=field->properties[15];options[11]=(int)(field->detection&7);options[12]=field->properties[11];options[13]=label_argb(field->properties[2],0xff000000);options[14]=label_argb(view->background,0xffffffff);options[15]=field->selection.location;options[16]=field->selection.location+field->selection.length;
     ui_scroll_input_options(object,metrics,options);
-    if(field->synced && field->synced_revision==field->revision && !memcmp(field->metrics,metrics,sizeof(metrics)) && !memcmp(field->options,options,sizeof(options)))return;
-    JNIEnv *env=attached_environment("Text input sync");static jmethodID method;if(!method){jclass type=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,type,"syncGuestEditor","(JLjava/lang/CharSequence;[F[I)V");(*env)->DeleteLocalRef(env,type);}
+    if(field->synced && field->synced_owner==owner && field->synced_revision==field->revision && !memcmp(field->metrics,metrics,sizeof(metrics)) && !memcmp(field->options,options,sizeof(options)))return;
+    JNIEnv *env=attached_environment("Text input sync");static jmethodID method;if(!method){jclass type=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,type,"syncGuestEditor","(JJLjava/lang/CharSequence;[F[I)V");(*env)->DeleteLocalRef(env,type);}
     jclass cls=(*env)->GetObjectClass(env,activity);jobject text=field->synced_revision!=field->revision ? label_rich_text(env,cls,text_editor_label(field)) : NULL;(*env)->DeleteLocalRef(env,cls);
     jfloatArray m=(*env)->NewFloatArray(env,COUNT(metrics));jintArray o=(*env)->NewIntArray(env,COUNT(options));(*env)->SetFloatArrayRegion(env,m,0,COUNT(metrics),metrics);(*env)->SetIntArrayRegion(env,o,0,COUNT(options),options);
-    (*env)->CallVoidMethod(env,activity,method,(jlong)object,text,m,o);(*env)->DeleteLocalRef(env,m);(*env)->DeleteLocalRef(env,o);
+    (*env)->CallVoidMethod(env,activity,method,(jlong)object,(jlong)owner,text,m,o);(*env)->DeleteLocalRef(env,m);(*env)->DeleteLocalRef(env,o);
     if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);stop("Android text input failed","UITextView");}
-    field->synced=1;field->synced_revision=field->revision;memcpy(field->metrics,metrics,sizeof(metrics));memcpy(field->options,options,sizeof(options));
+    field->synced=1;field->synced_owner=owner;field->synced_revision=field->revision;memcpy(field->metrics,metrics,sizeof(metrics));memcpy(field->options,options,sizeof(options));
 }
 static void ui_label_sync(Word object) {
     if (!label_object(object)) {
@@ -136,21 +136,18 @@ static void ui_label_sync(Word object) {
         ui_control_sync(object); return;
     }
     struct LabelState *s=label_state(object); struct ViewState *v=view_state(object),*layer=v->layer ? view_state(v->layer) : NULL;
-    double scale=screen_scale(),x=v->frame.x,y=v->frame.y,alpha=v->alpha; int visible=!v->hidden,attached=view_window(object)!=0;
-    for (Word parent=v->parent;parent;parent=view_state(parent)->parent) {
-        struct ViewState *p=view_state(parent); x+=p->frame.x-p->bounds.x; y+=p->frame.y-p->bounds.y;
-        visible&=!p->hidden; alpha*=p->alpha;
-    }
+    float geometry[11];int visibility[3];Word owner=view_host_geometry(object,geometry,visibility);
+    double scale=screen_scale(),x=geometry[0]/scale,y=geometry[1]/scale,alpha=geometry[4];int visible=visibility[0],attached=visibility[1];
     struct UIKitFont *font=s->font ? (void *)s->font : NULL; struct UIKitShadow *shadow=s->shadow ? (void *)s->shadow : NULL;
     float metrics[]={ (float)((font ? font->size : 17)*scale),(float)(x*scale),(float)(y*scale),(float)(v->frame.width*scale),(float)(v->frame.height*scale),(float)alpha,
         shadow ? (float)(shadow->blur*scale) : 0,shadow ? (float)(shadow->offset.width*scale) : 0,shadow ? (float)(shadow->offset.height*scale) : 0,
-        layer ? (float)(layer->corner*scale) : 0,layer ? (float)layer->z : 0,(float)view_window_level(object) };
+        layer ? (float)(layer->corner*scale) : 0,layer ? (float)layer->z : 0,(float)view_window_level(object),geometry[7],geometry[8],geometry[9],geometry[10] };
     jint options[]={ (jint)label_argb(s->color,0xff000000),(jint)s->alignment,(jint)s->lines,(jint)label_argb(v->background,0),visible && attached,s->adjusts,
         shadow ? (jint)label_argb(shadow->color,0x55000000) : 0,attached,(jint)s->line_break };
      
-    if (s->synced && s->synced_text==s->text && !memcmp(s->metrics,metrics,sizeof(metrics)) && !memcmp(s->options,options,sizeof(options))) return;
+    if (s->synced && s->synced_owner==owner && s->synced_text==s->text && !memcmp(s->metrics,metrics,sizeof(metrics)) && !memcmp(s->options,options,sizeof(options))) return;
     if (!attached && (!s->synced || !s->options[7])) return;
-    s->synced=1; s->synced_text=s->text;
+    s->synced=1; s->synced_owner=owner; s->synced_text=s->text;
     memcpy(s->metrics,metrics,sizeof(metrics)); memcpy(s->options,options,sizeof(options));
 #if I2A_DEVELOPMENT
     static unsigned label_traces;
@@ -164,10 +161,10 @@ static void ui_label_sync(Word object) {
     }
 #endif
     JNIEnv *env=attached_environment("UILabel sync"); jclass cls=(*env)->GetObjectClass(env,activity);
-    jmethodID sync=(*env)->GetMethodID(env,cls,"syncGuestLabel","(JLjava/lang/CharSequence;[F[I)V");
+    static jmethodID sync;if(!sync)sync=(*env)->GetMethodID(env,cls,"syncGuestLabel","(JJLjava/lang/CharSequence;[F[I)V");
     jfloatArray m=(*env)->NewFloatArray(env,COUNT(metrics)); jintArray o=(*env)->NewIntArray(env,COUNT(options));
     (*env)->SetFloatArrayRegion(env,m,0,COUNT(metrics),metrics); (*env)->SetIntArrayRegion(env,o,0,COUNT(options),options);
-    jobject text=label_rich_text(env,cls,s); (*env)->CallVoidMethod(env,activity,sync,(jlong)object,text,m,o);
+    jobject text=label_rich_text(env,cls,s); (*env)->CallVoidMethod(env,activity,sync,(jlong)object,(jlong)owner,text,m,o);
     (*env)->DeleteLocalRef(env,m); (*env)->DeleteLocalRef(env,o); (*env)->DeleteLocalRef(env,cls);
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); stop("Android label update failed","UILabel"); }
 }
@@ -275,22 +272,21 @@ static Word control_image_view(Word object,const char *selector) {
 }
 static void ui_control_sync(Word object) {
     struct ViewState *view=view_state(object); struct ControlState *state=view->control;
-    if (!state && view->background && class_inherits(read_word(object),external_class("_OBJC_CLASS_$_UIView"))) state=control_state(object);
+    if(view->table)return;
+    uint32_t background=ui_cell_background(object,label_argb(view->background,0));
+    if (!state && background && class_inherits(read_word(object),external_class("_OBJC_CLASS_$_UIView"))) state=control_state(object);
     if (!state) return;
-    double scale=screen_scale(),x=view->frame.x,y=view->frame.y,alpha=view->alpha; int visible=!view->hidden,enabled=view->interaction && state->enabled;
-    for (Word parent=view->parent;parent;parent=view_state(parent)->parent) {
-        struct ViewState *ancestor=view_state(parent); x+=ancestor->frame.x-ancestor->bounds.x; y+=ancestor->frame.y-ancestor->bounds.y;
-        visible&=!ancestor->hidden; enabled&=ancestor->interaction; alpha*=ancestor->alpha;
-    }
+    float geometry[11];int visibility[3];Word owner=view_host_geometry(object,geometry,visibility);
+    double scale=screen_scale(),x=geometry[0]/scale,y=geometry[1]/scale,alpha=geometry[4];int visible=visibility[0],enabled=visibility[2] && state->enabled;
     Word flags=control_flags(state),image=state->button ? control_content(state,flags,1) : state->image;
     if(state->button && state->image_view){struct GuestRect c=state->content_insets,i=state->image_insets;struct ViewState *child=view_state(state->image_view);control_state(state->image_view)->image=image;
         child->frame=(struct GuestRect){c.y+i.y,c.x+i.x,fmax(0,view->bounds.width-c.y-c.height-i.y-i.height),fmax(0,view->bounds.height-c.x-c.width-i.x-i.width)};child->bounds=(struct GuestRect){0,0,child->frame.width,child->frame.height};ui_control_sync(state->image_view);image=0;}
     int attached=view_window(object)!=0;
     struct ImageSize natural=image ? ui_image_size(image) : (struct ImageSize){0};
     float metrics[]={(float)(x*scale),(float)(y*scale),(float)(view->frame.width*scale),(float)(view->frame.height*scale),(float)alpha,
-        (float)((view->layer ? view_state(view->layer)->corner : 0)*scale),(float)(view->layer ? view_state(view->layer)->z : 0),(float)(natural.width*scale),(float)(natural.height*scale),(float)view_window_level(object)};
+        (float)((view->layer ? view_state(view->layer)->corner : 0)*scale),(float)(view->layer ? view_state(view->layer)->z : 0),(float)(natural.width*scale),(float)(natural.height*scale),(float)view_window_level(object),geometry[7],geometry[8],geometry[9],geometry[10]};
     visible&=!state->indicator || state->animating || !state->hides;
-    jint options[]={visible && attached,attached,state->button,enabled,(jint)label_argb(view->background,0),(jint)view->content_mode,view->exclusive_touch,view->accessibility_element,state->indicator,state->animating,(jint)label_argb(state->indicator_color,0xff808080)};
+    jint options[]={visible && attached,attached,state->button,enabled,(jint)background,(jint)view->content_mode,view->exclusive_touch,view->accessibility_element,state->indicator,state->animating,(jint)label_argb(state->indicator_color,0xff808080)};
     if (state->button && state->label) {
         struct LabelState *label=label_state(state->label); Word title=control_content(state,flags,0),color=control_content(state,flags,2);
         if (!title) title=state->empty_title; if (!color) color=state->default_color;
@@ -300,12 +296,12 @@ static void ui_control_sync(Word object) {
         struct ViewState *child=view_state(state->label); child->frame=(struct GuestRect){c.y+t.y,c.x+t.x,fmax(0,view->bounds.width-c.y-c.height-t.y-t.height),fmax(0,view->bounds.height-c.x-c.width-t.x-t.width)};
         child->bounds=(struct GuestRect){0,0,child->frame.width,child->frame.height}; ui_label_sync(state->label);
     }
-    if (state->synced && state->synced_image==image && state->synced_accessibility==view->accessibility_label &&
+    if (state->synced && state->synced_owner==owner && state->synced_image==image && state->synced_accessibility==view->accessibility_label &&
         !memcmp(state->metrics,metrics,sizeof(metrics)) && !memcmp(state->options,options,sizeof(options))) return;
     int content_changed=!state->synced || state->synced_image!=image || (attached && !state->options[1]) || (options[0] && !state->options[0]);
     if (!attached && (!state->synced || !state->options[1])) return;
     JNIEnv *env=attached_environment("UIKit control update"); static jmethodID sync;
-    if (!sync) { jclass cls=(*env)->GetObjectClass(env,activity); sync=(*env)->GetMethodID(env,cls,"syncGuestControl","(J[BZ[F[ILjava/lang/String;)V"); (*env)->DeleteLocalRef(env,cls); }
+    if (!sync) { jclass cls=(*env)->GetObjectClass(env,activity); sync=(*env)->GetMethodID(env,cls,"syncGuestControl","(JJ[BZ[F[ILjava/lang/String;)V"); (*env)->DeleteLocalRef(env,cls); }
     jbyteArray bytes=NULL;
     if (content_changed && image && attached) {
         struct HostObject *png=(void *)image_png((void *)image);
@@ -314,11 +310,11 @@ static void ui_control_sync(Word object) {
     jfloatArray m=(*env)->NewFloatArray(env,COUNT(metrics)); jintArray o=(*env)->NewIntArray(env,COUNT(options));
     (*env)->SetFloatArrayRegion(env,m,0,COUNT(metrics),metrics); (*env)->SetIntArrayRegion(env,o,0,COUNT(options),options);
     jstring description=http_java_string(env,view->accessibility_label);
-    (*env)->CallVoidMethod(env,activity,sync,(jlong)object,bytes,(jboolean)content_changed,m,o,description);
+    (*env)->CallVoidMethod(env,activity,sync,(jlong)object,(jlong)owner,bytes,(jboolean)content_changed,m,o,description);
     if (bytes) (*env)->DeleteLocalRef(env,bytes); if (description) (*env)->DeleteLocalRef(env,description);
     (*env)->DeleteLocalRef(env,m); (*env)->DeleteLocalRef(env,o);
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); stop("Android control update failed","UIKit"); }
-    state->synced=1; state->synced_image=image; state->synced_accessibility=view->accessibility_label;
+    state->synced=1; state->synced_owner=owner; state->synced_image=image; state->synced_accessibility=view->accessibility_label;
     memcpy(state->metrics,metrics,sizeof(metrics)); memcpy(state->options,options,sizeof(options));
 }
 static Word control_factory(Word cls,const char *selector,Word type) {
@@ -448,7 +444,7 @@ static void ui_view_request_display(Word object,const char *selector) {
 }
 static struct GuestSize image_view_size(Word object,const char *selector,struct GuestSize limit) { Word image=control_state(object)->image; struct ImageSize size=image ? ui_image_size(image) : (struct ImageSize){0}; return (struct GuestSize){size.width,size.height}; }
 static void image_view_fit(Word object,const char *selector) { struct ViewState *view=view_state(object); struct GuestSize size=image_view_size(object,selector,(struct GuestSize){0}); struct GuestRect frame=view->frame; frame.width=size.width; frame.height=size.height; view_set_frame(object,selector,frame); }
-static int ui_view_rendered(Word object) { return label_object(object) || view_state(object)->control!=NULL || view_state(object)->web!=NULL || view_state(object)->input!=NULL; }
+static int ui_view_rendered(Word object) { return label_object(object) || view_state(object)->control!=NULL || view_state(object)->web!=NULL || view_state(object)->input!=NULL || view_state(object)->table!=NULL; }
 static void ui_view_load_label(Word object,plist_t node){
     const char *text=plist_get_string_ptr(plist_dict_get_item(node,"text"),NULL);if(text)label_text(object,"Archived label",copy_string(text));
     plist_t color=plist_dict_get_item(node,"textColor");if(plist_get_node_type(color)==PLIST_ARRAY){double rgba[4]={0};for(unsigned i=0;i<4;++i)plist_get_real_val(plist_array_get_item(color,i),rgba+i);label_color(object,"Archived label",ui_color_rgba(external_class("_OBJC_CLASS_$_UIColor"),"colorWithRed:green:blue:alpha:",rgba[0],rgba[1],rgba[2],rgba[3]));}
